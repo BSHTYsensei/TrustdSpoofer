@@ -1,0 +1,15 @@
+cat > control << 'EOF'
+Package: com.yourname.appsync18
+Name: AppSync iOS18
+Version: 1.0.0
+Architecture: iphoneos-arm64e
+Description: iOS 18 AppSync (Rootless)
+Depends: mobilesubstrate (>= 0.9.5000) | ellekit (>= 1.0)
+Conflicts: com.linusyang.appsync
+Replaces: com.linusyang.appsync
+Provides: com.linusyang.appsync
+Maintainer: YourName <your@email.com>
+Author: YourName <your@email.com>
+Section: Tweaks
+Tag: purpose::extension, compatible::ios18
+EOF
