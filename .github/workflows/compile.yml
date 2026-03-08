@@ -1,0 +1,148 @@
+name: 编译 TrustdSpoofer.dylib (v4)
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  pull_request:
+    branches: [ "main", "master" ]
+  workflow_dispatch:  # 手动触发
+
+jobs:
+  build:
+    name: 编译动态库
+    runs-on: macos-latest
+    permissions:
+      contents: read
+      actions: write
+      artifacts: write
+    
+    steps:
+      # 步骤1: 检出代码 (v4)
+      - name: 检出代码
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+      
+      # 步骤2: 显示编译环境
+      - name: 显示环境信息
+        run: |
+          echo "🏠 运行环境: $(uname -a)"
+          echo "🔧 Clang 版本: $(clang --version | head -n 1)"
+          echo "📱 SDK 路径: $(xcrun --sdk iphoneos --show-sdk-path 2>/dev/null || echo '未找到')"
+      
+      # 步骤3: 创建源码文件（如果没有）
+      - name: 检查源码
+        run: |
+          if [ ! -f "TrustdSpoofer.c" ]; then
+            echo "❌ 找不到 TrustdSpoofer.c"
+            exit 1
+          fi
+          echo "✅ 找到源码文件"
+          ls -la TrustdSpoofer.c
+      
+      # 步骤4: 编译 dylib
+      - name: 编译 dylib
+        run: |
+          echo "🔨 开始编译..."
+          clang -dynamiclib \
+                -arch arm64 \
+                -arch arm64e \
+                -isysroot $(xcrun --sdk iphoneos --show-sdk-path) \
+                -framework Security \
+                -framework Foundation \
+                -o TrustdSpoofer.dylib \
+                TrustdSpoofer.c \
+                -Wno-error=implicit-function-declaration
+          
+          if [ $? -eq 0 ]; then
+            echo "✅ 编译成功！"
+          else
+            echo "❌ 编译失败"
+            exit 1
+          fi
+      
+      # 步骤5: 验证编译结果
+      - name: 验证 dylib
+        run: |
+          echo "📦 文件信息:"
+          file TrustdSpoofer.dylib
+          echo ""
+          echo "📏 文件大小:"
+          ls -lh TrustdSpoofer.dylib
+          echo ""
+          echo "🔍 架构信息:"
+          lipo -info TrustdSpoofer.dylib 2>/dev/null || echo "单架构文件"
+      
+      # 步骤6: 上传编译产物 (v4)
+      - name: 上传 dylib
+        uses: actions/upload-artifact@v4
+        with:
+          name: TrustdSpoofer.dylib
+          path: TrustdSpoofer.dylib
+          if-no-files-found: error
+          retention-days: 90
+          compression-level: 0  # 不压缩，直接上传
+      
+      # 步骤7: 创建完整包
+      - name: 创建完整包
+        run: |
+          mkdir -p package
+          cp TrustdSpoofer.dylib package/
+          
+          # 创建 plist 文件
+          cat > package/TrustdSpoofer.plist << 'EOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+              <key>Filter</key>
+              <dict>
+                  <key>Bundles</key>
+                  <array>
+                      <string>com.apple.trustd</string>
+                  </array>
+              </dict>
+          </dict>
+          </plist>
+          EOF
+          
+          # 创建 Info.plist
+          cat > package/Info.plist << 'EOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+              <key>CFBundleExecutable</key>
+              <string>TrustdInjector</string>
+              <key>CFBundleIdentifier</key>
+              <string>com.yourname.trustdinjector</string>
+              <key>CFBundlePackageType</key>
+              <string>APPL</string>
+              <key>MinimumOSVersion</key>
+              <string>12.0</string>
+          </dict>
+          </plist>
+          EOF
+          
+          # 打包
+          cd package
+          zip -r ../TrustdSpoofer_Complete.zip *
+          cd ..
+      
+      # 步骤8: 上传完整包
+      - name: 上传完整包
+        uses: actions/upload-artifact@v4
+        with:
+          name: TrustdSpoofer_Complete
+          path: TrustdSpoofer_Complete.zip
+          retention-days: 90
+      
+      # 步骤9: 创建 Release
+      - name: 创建 Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v1
+        with:
+          files: |
+            TrustdSpoofer.dylib
+            TrustdSpoofer_Complete.zip
+          generate_release_notes: true
