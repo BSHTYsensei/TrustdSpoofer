@@ -1,0 +1,109 @@
+cat > .github/workflows/build.yml << 'EOF'
+name: Build AppSync iOS18
+
+on:
+  push:
+    branches: [ "main", "master" ]
+    tags: [ "v*" ]
+  pull_request:
+    branches: [ "main", "master" ]
+  workflow_dispatch:  # 手动触发
+
+jobs:
+  build:
+    runs-on: macos-latest  # 使用最新的 macOS（目前是 macOS-14）
+    
+    steps:
+      # 使用最新版本的 actions
+      - name: Checkout code
+        uses: actions/checkout@v4  # 使用 v4（完全可用）
+      
+      - name: Setup environment
+        run: |
+          # 安装基础工具
+          brew update
+          brew install ldid xz make
+          
+          # 设置环境变量
+          echo "THEOS=~/theos" >> $GITHUB_ENV
+          echo "PATH=~/theos/bin:$PATH" >> $GITHUB_ENV
+      
+      - name: Cache Theos
+        id: cache-theos
+        uses: actions/cache@v4  # 使用 v4 缓存
+        with:
+          path: ~/theos
+          key: ${{ runner.os }}-theos-${{ hashFiles('**/Makefile') }}
+          restore-keys: |
+            ${{ runner.os }}-theos-
+      
+      - name: Install Theos
+        if: steps.cache-theos.outputs.cache-hit != 'true'
+        run: |
+          # 克隆 Theos
+          git clone --recursive https://github.com/theos/theos.git ~/theos
+          
+          # 下载 iOS SDK
+          cd ~/theos
+          curl -L -o sdk.zip https://github.com/theos/sdks/releases/latest/download/iPhoneOS16.5.sdk.zip
+          unzip -q sdk.zip -d sdks/
+          rm sdk.zip
+      
+      - name: Build package
+        run: |
+          # 清理旧构建
+          make clean || true
+          
+          # 设置编译参数
+          export ARCHS="arm64 arm64e"
+          export TARGET="iphone:clang:latest:18.0"
+          export THEOS_PACKAGE_SCHEME="rootless"
+          
+          # 编译
+          make package FINALPACKAGE=1
+          
+          # 检查结果
+          if [ -d "packages" ]; then
+            echo "✅ 编译成功"
+            ls -la packages/
+          else
+            echo "❌ 编译失败"
+            exit 1
+          fi
+      
+      - name: Verify package
+        run: |
+          # 验证 deb 包
+          DEB_FILE=$(ls packages/*.deb | head -n 1)
+          echo "验证: $DEB_FILE"
+          
+          # 检查文件大小
+          if [ -f "$DEB_FILE" ]; then
+            SIZE=$(wc -c < "$DEB_FILE")
+            if [ $SIZE -gt 1000 ]; then
+              echo "✅ 包大小正常: $SIZE bytes"
+            else
+              echo "❌ 包太小: $SIZE bytes"
+              exit 1
+            fi
+          else
+            echo "❌ 找不到 deb 文件"
+            exit 1
+          fi
+      
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4  # 使用 v4（完全可用）
+        with:
+          name: appsync-ios18-${{ github.sha }}
+          path: packages/*.deb
+          retention-days: 30  # 保留30天
+      
+      - name: Create Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2  # 使用 v2（最新）
+        with:
+          files: packages/*.deb
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+EOF
