@@ -1,0 +1,24 @@
+cat > .gitignore << 'EOF'
+# 编译产物
+packages/
+*.deb
+*.dylib
+*.o
+.theos/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# 系统文件
+.DS_Store
+build/
+tmp/
+
+# 日志
+*.log
+*.trace
+EOF
