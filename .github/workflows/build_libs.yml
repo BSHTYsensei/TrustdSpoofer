@@ -3,9 +3,17 @@ name: Build iOS ldid and static dependencies
 on:
   workflow_dispatch:
   push:
-    
+    paths:
+      - "ldid.zip"
+      - "ldid.cpp"
+      - "ldid.hpp"
+      - ".github/workflows/build_libs.yml"
   pull_request:
-    
+    paths:
+      - "ldid.zip"
+      - "ldid.cpp"
+      - "ldid.hpp"
+      - ".github/workflows/build_libs.yml"
 
 permissions:
   contents: read
@@ -19,10 +27,12 @@ env:
   OPENSSL_VERSION: "openssl-3.5.9"
   CURL_VERSION: "curl-8_23_0"
   LIBPLIST_VERSION: "2.8.0"
-  LIBARCHIVE_VERSION: "v3.8.10"
+  LIBARCHIVE_VERSION: "v3.8.9"
   XZ_VERSION: "v5.8.4"
   ZSTD_VERSION: "v1.5.7"
   BZIP2_VERSION: "1.0.8"
+  OPT_CFLAGS: "-O3 -DNDEBUG -ffunction-sections -fdata-sections"
+  LTO_CFLAGS: "-flto=thin"
 
 jobs:
   build-ios-arm64:
@@ -44,6 +54,8 @@ jobs:
           clang --version
           cmake --version
           sysctl -n hw.ncpu
+          echo "Release optimization: ${OPT_CFLAGS} ${LTO_CFLAGS}"
+          echo "Note: generic arm64 baseline retained; no Apple-Silicon host-specific -mcpu flags."
 
           SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
           test -d "${SDK}/System/Library/Frameworks/Security.framework"
@@ -108,7 +120,8 @@ jobs:
           cd "${WS}/build-deps/openssl-src"
 
           export IPHONEOS_DEPLOYMENT_TARGET="${IOS_DEPLOYMENT_TARGET}"
-          export CFLAGS="-O2 -miphoneos-version-min=${IOS_DEPLOYMENT_TARGET}"
+          export CFLAGS="${OPT_CFLAGS} ${LTO_CFLAGS} -arch arm64 -isysroot ${SDK} -miphoneos-version-min=${IOS_DEPLOYMENT_TARGET}"
+          echo "OpenSSL CFLAGS=${CFLAGS}"
           ./Configure ios64-xcrun \
             no-shared no-tests no-apps no-dso no-async \
             --prefix="${PREFIX}" \
@@ -123,11 +136,12 @@ jobs:
           test -n "${CRYPTO_LIB}"
           test -n "${SSL_LIB}"
           test -n "${OPENSSL_HEADERS}"
-          cp -R "${PREFIX}/include/openssl" source/openssl_include/
-          cp "${CRYPTO_LIB}" source/openssl_lib/libcrypto.a
-          cp "${SSL_LIB}" source/openssl_lib/libssl.a
-          xcrun lipo -info source/openssl_lib/libcrypto.a
-          xcrun lipo -info source/openssl_lib/libssl.a
+          mkdir -p "${WS}/source/openssl_include" "${WS}/source/openssl_lib"
+          cp -R "${PREFIX}/include/openssl" "${WS}/source/openssl_include/"
+          cp "${CRYPTO_LIB}" "${WS}/source/openssl_lib/libcrypto.a"
+          cp "${SSL_LIB}" "${WS}/source/openssl_lib/libssl.a"
+          xcrun lipo -info "${WS}/source/openssl_lib/libcrypto.a"
+          xcrun lipo -info "${WS}/source/openssl_lib/libssl.a"
 
       - name: Build libplist static library for iOS arm64
         shell: bash
@@ -145,10 +159,11 @@ jobs:
           export CXX="${IOS_CXX}"
           export AR="${IOS_AR}"
           export RANLIB="${IOS_RANLIB}"
-          export CFLAGS="-O2 -arch arm64 -isysroot ${SDK} -miphoneos-version-min=${IOS_DEPLOYMENT_TARGET}"
-          export CXXFLAGS="${CFLAGS} -std=c++17"
+          export CFLAGS="${OPT_CFLAGS} ${LTO_CFLAGS} -arch arm64 -isysroot ${SDK} -miphoneos-version-min=${IOS_DEPLOYMENT_TARGET}"
+          export CXXFLAGS="${OPT_CFLAGS} ${LTO_CFLAGS} -std=c++17 -arch arm64 -isysroot ${SDK} -miphoneos-version-min=${IOS_DEPLOYMENT_TARGET}"
+          echo "libplist CFLAGS=${CFLAGS}"
           export CPPFLAGS="-arch arm64 -isysroot ${SDK} -miphoneos-version-min=${IOS_DEPLOYMENT_TARGET}"
-          export LDFLAGS="-arch arm64 -isysroot ${SDK} -miphoneos-version-min=${IOS_DEPLOYMENT_TARGET}"
+          export LDFLAGS="${LTO_CFLAGS} -arch arm64 -isysroot ${SDK} -miphoneos-version-min=${IOS_DEPLOYMENT_TARGET}"
 
           ./autogen.sh \
             --host=aarch64-apple-darwin \
@@ -161,9 +176,10 @@ jobs:
           PLIST_LIB="$(find "${PREFIX}/lib" -type f -name 'libplist-2.0.a' -print -quit)"
           test -n "${PLIST_LIB}"
           test -f "${PREFIX}/include/plist/plist.h"
-          cp -R "${PREFIX}/include/." source/libplist_include/
-          cp "${PLIST_LIB}" source/libplist_lib/libplist-2.0.a
-          xcrun lipo -info source/libplist_lib/libplist-2.0.a
+          mkdir -p "${WS}/source/libplist_include" "${WS}/source/libplist_lib"
+          cp -R "${PREFIX}/include/." "${WS}/source/libplist_include/"
+          cp "${PLIST_LIB}" "${WS}/source/libplist_lib/libplist-2.0.a"
+          xcrun lipo -info "${WS}/source/libplist_lib/libplist-2.0.a"
 
       - name: Build XZ liblzma static library for iOS arm64
         shell: bash
@@ -177,6 +193,8 @@ jobs:
             https://github.com/tukaani-project/xz.git "${WS}/build-deps/xz-src"
           cmake -S "${WS}/build-deps/xz-src" -B "${WS}/build-deps/xz-build" -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_FLAGS_RELEASE="${OPT_CFLAGS} ${LTO_CFLAGS}" \
+            -DCMAKE_CXX_FLAGS_RELEASE="${OPT_CFLAGS} ${LTO_CFLAGS}" \
             -DCMAKE_SYSTEM_NAME=iOS \
             -DCMAKE_OSX_SYSROOT="${SDK}" \
             -DCMAKE_OSX_ARCHITECTURES=arm64 \
@@ -212,6 +230,8 @@ jobs:
             https://github.com/facebook/zstd.git "${WS}/build-deps/zstd-src"
           cmake -S "${WS}/build-deps/zstd-src/build/cmake" -B "${WS}/build-deps/zstd-build" -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_FLAGS_RELEASE="${OPT_CFLAGS} ${LTO_CFLAGS}" \
+            -DCMAKE_CXX_FLAGS_RELEASE="${OPT_CFLAGS} ${LTO_CFLAGS}" \
             -DCMAKE_SYSTEM_NAME=iOS \
             -DCMAKE_OSX_SYSROOT="${SDK}" \
             -DCMAKE_OSX_ARCHITECTURES=arm64 \
@@ -246,7 +266,7 @@ jobs:
           make -C "${SRC}" clean || true
           make -C "${SRC}" -j"${BUILD_JOBS}" libbz2.a \
             CC="${IOS_CC}" AR="${IOS_AR}" RANLIB="${IOS_RANLIB}" \
-            CFLAGS="-O2 -D_FILE_OFFSET_BITS=64 -arch arm64 -isysroot ${SDK} -miphoneos-version-min=${IOS_DEPLOYMENT_TARGET}"
+            CFLAGS="${OPT_CFLAGS} ${LTO_CFLAGS} -D_FILE_OFFSET_BITS=64 -arch arm64 -isysroot ${SDK} -miphoneos-version-min=${IOS_DEPLOYMENT_TARGET}"
           cp "${SRC}/bzlib.h" "${PREFIX}/include/"
           cp "${SRC}/libbz2.a" "${PREFIX}/ios-arm64/libbz2.a"
           test -s "${PREFIX}/include/bzlib.h"
@@ -269,9 +289,9 @@ jobs:
           export CC="${IOS_CC}"
           export AR="${IOS_AR}"
           export RANLIB="${IOS_RANLIB}"
-          export CFLAGS="-O2 -arch arm64 -isysroot ${SDK} -miphoneos-version-min=${IOS_DEPLOYMENT_TARGET}"
+          export CFLAGS="${OPT_CFLAGS} ${LTO_CFLAGS} -arch arm64 -isysroot ${SDK} -miphoneos-version-min=${IOS_DEPLOYMENT_TARGET}"
           export CPPFLAGS="-I${OPENSSL_PREFIX}/include -arch arm64 -isysroot ${SDK} -miphoneos-version-min=${IOS_DEPLOYMENT_TARGET}"
-          export LDFLAGS="-L${OPENSSL_PREFIX}/lib -arch arm64 -isysroot ${SDK} -miphoneos-version-min=${IOS_DEPLOYMENT_TARGET} -framework Security -framework CoreFoundation -framework SystemConfiguration"
+          export LDFLAGS="${LTO_CFLAGS} -L${OPENSSL_PREFIX}/lib -arch arm64 -isysroot ${SDK} -miphoneos-version-min=${IOS_DEPLOYMENT_TARGET} -framework Security -framework CoreFoundation -framework SystemConfiguration"
 
           ./configure \
             --host=aarch64-apple-darwin \
@@ -309,6 +329,8 @@ jobs:
             https://github.com/libarchive/libarchive.git "${WS}/build-deps/libarchive-src"
           cmake -S "${WS}/build-deps/libarchive-src" -B "${WS}/build-deps/libarchive-build" -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_FLAGS_RELEASE="${OPT_CFLAGS} ${LTO_CFLAGS}" \
+            -DCMAKE_CXX_FLAGS_RELEASE="${OPT_CFLAGS} ${LTO_CFLAGS}" \
             -DCMAKE_SYSTEM_NAME=iOS \
             -DCMAKE_OSX_SYSROOT="${SDK}" \
             -DCMAKE_OSX_ARCHITECTURES=arm64 \
@@ -401,7 +423,7 @@ jobs:
           cp "${WS}/source/ldid.hpp" "${WS}/theos-build/ldid.hpp"
 
           "${IOS_CXX}" \
-            -std=c++20 -O3 -DNDEBUG -fvisibility=hidden \
+            -std=c++20 ${OPT_CFLAGS} ${LTO_CFLAGS} -fvisibility=hidden \
             -target "arm64-apple-ios${IOS_DEPLOYMENT_TARGET}" \
             -isysroot "${SDK}" \
             -I"${WS}/source/libplist_include" \
@@ -426,7 +448,7 @@ jobs:
             -framework CFNetwork \
             -framework Foundation \
             -lxml2 -liconv -lz \
-            -Wl,-dead_strip -Wl,-undefined,error \
+            -Wl,-dead_strip -Wl,-dead_strip_dylibs -Wl,-undefined,error \
             -o "${WS}/build/ldid"
           chmod 755 "${WS}/build/ldid"
 
