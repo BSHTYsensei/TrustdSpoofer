@@ -539,10 +539,26 @@ jobs:
           xcrun otool -L "${BINARY}"
           BUILD_INFO="$(xcrun vtool -show-build "${BINARY}")"
           printf '%s\n' "${BUILD_INFO}"
-          if ! grep -Eq 'sdk[[:space:]]+16\.5([[:space:]]|$)' <<<"${BUILD_INFO}"; then
-            echo "ERROR: final ldid binary was not linked against the iOS 16.5 SDK" >&2
+
+          # vtool/Xcode versions may print the same SDK as either 16.5 or
+          # 16.5.0. Parse the SDK field rather than relying on a substring grep.
+          SDK_RECORDED="$(awk '$1 == "sdk" { print $2; exit }' <<<"${BUILD_INFO}")"
+          PLATFORM_RECORDED="$(awk '$1 == "platform" { print $2; exit }' <<<"${BUILD_INFO}")"
+          echo "Recorded Mach-O platform: ${PLATFORM_RECORDED:-<missing>}"
+          echo "Recorded Mach-O SDK version: ${SDK_RECORDED:-<missing>}"
+
+          if [[ "${PLATFORM_RECORDED}" != "IOS" ]]; then
+            echo "ERROR: final ldid binary does not record the iOS device platform (got '${PLATFORM_RECORDED:-missing}')" >&2
             exit 1
           fi
+          case "${SDK_RECORDED}" in
+            16.5|16.5.0) ;;
+            *)
+              echo "ERROR: final ldid binary must record iOS 16.5 SDK (16.5 or 16.5.0); got '${SDK_RECORDED:-missing}'" >&2
+              echo "The compiler command uses IOS_SDK_PATH=${IOS_SDK_PATH}; inspect the SDKSettings.plist Version and clang driver's -platform_version arguments if this still fails." >&2
+              exit 1
+              ;;
+          esac
 
           if xcrun otool -L "${BINARY}" | grep -E 'lib(crypto|ssl|curl|archive|plist|lzma|zstd|bz2)[^/]*\\.dylib'; then
             echo "ERROR: a third-party dependency was linked dynamically" >&2
