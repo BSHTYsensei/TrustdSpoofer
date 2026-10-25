@@ -25,7 +25,7 @@ concurrency:
 env:
   IOS_DEPLOYMENT_TARGET: "16.0"
   OPENSSL_VERSION: "openssl-3.5.9"
-  CURL_VERSION: "curl-8_23_0"
+  CURL_VERSION: "8.23.0"
   LIBPLIST_VERSION: "2.8.0"
   LIBARCHIVE_VERSION: "v3.8.9"
   XZ_VERSION: "v5.8.4"
@@ -57,6 +57,9 @@ jobs:
           echo "Release optimization: ${OPT_CFLAGS} ${LTO_CFLAGS}"
           echo "Note: generic arm64 baseline retained; no Apple-Silicon host-specific -mcpu flags."
 
+          # Use the iPhoneOS SDK bundled with this runner's selected Xcode.
+          # The legacy Theos iPhoneOS16.5 SDK archive is still listed upstream,
+          # but this workflow deliberately does not depend on that extra download.
           SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
           test -d "${SDK}/System/Library/Frameworks/Security.framework"
           test -f "${SDK}/usr/include/zlib.h"
@@ -282,9 +285,19 @@ jobs:
           CURL_PREFIX="${WS}/third_party/curl"
           CURL_HEADERS="${WS}/third_party/curl-headers"
 
-          git clone --depth 1 --branch "${CURL_VERSION}" \
-            https://github.com/curl/curl.git "${WS}/build-deps/curl-src"
-          cd "${WS}/build-deps/curl-src"
+          # Build from curl's official release tarball rather than Git's annotated
+          # release tag. The Git checkout can omit the generated ./configure file.
+          CURL_TARBALL="${WS}/build-deps/curl-${CURL_VERSION}.tar.xz"
+          CURL_SOURCE="${WS}/build-deps/curl-${CURL_VERSION}"
+          curl -fL --retry 5 --retry-all-errors --connect-timeout 30 --max-time 900 \
+            "https://curl.se/download/curl-${CURL_VERSION}.tar.xz" \
+            -o "${CURL_TARBALL}"
+          test -s "${CURL_TARBALL}"
+          tar -xJf "${CURL_TARBALL}" -C "${WS}/build-deps"
+          test -f "${CURL_SOURCE}/configure"
+          test -f "${CURL_SOURCE}/include/curl/curl.h"
+          chmod +x "${CURL_SOURCE}/configure"
+          cd "${CURL_SOURCE}"
 
           export CC="${IOS_CC}"
           export AR="${IOS_AR}"
