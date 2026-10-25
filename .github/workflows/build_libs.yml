@@ -23,6 +23,9 @@ concurrency:
   cancel-in-progress: true
 
 env:
+  IOS_SDK_VERSION: "16.5"
+  IOS_SDK_URL: "https://github.com/theos/sdks/releases/download/master-146e41f/iPhoneOS16.5.sdk.tar.xz"
+  IOS_SDK_SHA256: "5e0fd3f01266cce4ce012d4a99b38eb56578fca40d09edc81cd83dee958202fb"
   IOS_DEPLOYMENT_TARGET: "16.0"
   OPENSSL_VERSION: "openssl-3.5.9"
   CURL_VERSION: "8.23.0"
@@ -44,7 +47,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install build tools
+      - name: Install build tools and pinned iOS 16.5 SDK
         shell: bash
         run: |
           set -euo pipefail
@@ -55,20 +58,30 @@ jobs:
           cmake --version
           sysctl -n hw.ncpu
           echo "Release optimization: ${OPT_CFLAGS} ${LTO_CFLAGS}"
-          echo "Note: generic arm64 baseline retained; no Apple-Silicon host-specific -mcpu flags."
+          echo "Target SDK: iPhoneOS${IOS_SDK_VERSION}.sdk; deployment target: iOS ${IOS_DEPLOYMENT_TARGET}"
+          echo "Generic arm64 baseline; no host-specific Apple Silicon CPU flags."
 
-          # Use the iPhoneOS SDK bundled with this runner's selected Xcode.
-          # The legacy Theos iPhoneOS16.5 SDK archive is still listed upstream,
-          # but this workflow deliberately does not depend on that extra download.
-          SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
-          test -d "${SDK}/System/Library/Frameworks/Security.framework"
-          test -f "${SDK}/usr/include/zlib.h"
+          # Use Theos' patched iOS 16.5 SDK for every library and the final ldid link.
+          # The URL is pinned to a release asset and the downloaded archive is SHA-256 checked.
+          SDK_ARCHIVE="${RUNNER_TEMP}/iPhoneOS${IOS_SDK_VERSION}.sdk.tar.xz"
+          SDK_PARENT="${RUNNER_TEMP}/theos-sdks/SDKs"
+          SDK="${SDK_PARENT}/iPhoneOS${IOS_SDK_VERSION}.sdk"
+          mkdir -p "${SDK_PARENT}"
+          curl -fL --retry 5 --retry-all-errors --connect-timeout 30 --max-time 900 \
+            "${IOS_SDK_URL}" -o "${SDK_ARCHIVE}"
+          echo "${IOS_SDK_SHA256}  ${SDK_ARCHIVE}" | shasum -a 256 -c -
+          tar -xJf "${SDK_ARCHIVE}" -C "${SDK_PARENT}"
+          test -f "${SDK}/SDKSettings.plist"
+          test -f "${SDK}/usr/include/mach-o/loader.h"
           test -f "${SDK}/usr/lib/libz.tbd"
+          test -d "${SDK}/System/Library/Frameworks/Security.framework"
+          echo "Pinned SDK contents:"
+          /usr/libexec/PlistBuddy -c 'Print :Version' "${SDK}/SDKSettings.plist" || true
           echo "IOS_SDK_PATH=${SDK}" >> "${GITHUB_ENV}"
-          echo "IOS_CC=$(xcrun --sdk iphoneos --find clang)" >> "${GITHUB_ENV}"
-          echo "IOS_CXX=$(xcrun --sdk iphoneos --find clang++)" >> "${GITHUB_ENV}"
-          echo "IOS_AR=$(xcrun --sdk iphoneos --find ar)" >> "${GITHUB_ENV}"
-          echo "IOS_RANLIB=$(xcrun --sdk iphoneos --find ranlib)" >> "${GITHUB_ENV}"
+          echo "IOS_CC=$(xcrun --find clang)" >> "${GITHUB_ENV}"
+          echo "IOS_CXX=$(xcrun --find clang++)" >> "${GITHUB_ENV}"
+          echo "IOS_AR=$(xcrun --find ar)" >> "${GITHUB_ENV}"
+          echo "IOS_RANLIB=$(xcrun --find ranlib)" >> "${GITHUB_ENV}"
           echo "BUILD_JOBS=$(sysctl -n hw.ncpu)" >> "${GITHUB_ENV}"
 
       - name: Prepare source tree and output directories
@@ -98,8 +111,47 @@ jobs:
             exit 1
           fi
 
+          # Avoid collisions with Apple SDK macros, and fix the LC_SEGMENT values.
+          # This is idempotent so checked-in ldid.cpp may already contain the same fixes.
+          python3 - <<'PYFIX'
+          from pathlib import Path
+          import re
+          path = Path("source/ldid.cpp")
+          text = path.read_text()
+          marker = "namespace ldid {\nnamespace iosinject {"
+          cut = text.find(marker)
+          if cut < 0:
+              raise SystemExit("Cannot locate iosinject section in ldid.cpp")
+          head, tail = text[:cut], text[cut:]
+          renames = {
+              "MH_MAGIC_64": "kMH_MAGIC_64", "MH_CIGAM_64": "kMH_CIGAM_64",
+              "MH_MAGIC": "kMH_MAGIC", "MH_CIGAM": "kMH_CIGAM",
+              "FAT_MAGIC_64": "kFAT_MAGIC_64", "FAT_CIGAM_64": "kFAT_CIGAM_64",
+              "FAT_MAGIC": "kFAT_MAGIC", "FAT_CIGAM": "kFAT_CIGAM",
+              "LC_SEGMENT_64": "kLC_SEGMENT_64", "LC_SEGMENT": "kLC_SEGMENT",
+              "LC_CODE_SIGNATURE": "kLC_CODE_SIGNATURE",
+          }
+          for old, new in renames.items():
+              head = re.sub(r"\b" + re.escape(old) + r"\b", new, head)
+          head = head.replace(
+              "constexpr uint32_t kLC_SEGMENT = 0x19;\nconstexpr uint32_t kLC_SEGMENT_64 = 0x1;",
+              "constexpr uint32_t kLC_SEGMENT = 0x1;\nconstexpr uint32_t kLC_SEGMENT_64 = 0x19;")
+          text = head + tail
+          text = text.replace('sprintf(p,"%s/%s",a,b);',
+                              'snprintf(p, strlen(a) + strlen(b) + 2, "%s/%s", a, b);')
+          text = text.replace('sprintf(r,"@rpath/%s/%s",name,b);',
+                              'snprintf(r, strlen("@rpath/") + strlen(name) + strlen(b) + 2, "@rpath/%s/%s", name, b);')
+          text = text.replace('sprintf(r,"@rpath/%s",rel);',
+                              'snprintf(r, strlen("@rpath/") + strlen(rel) + 1, "@rpath/%s", rel);')
+          path.write_text(text)
+          PYFIX
+
           test -s source/ldid.cpp
           test -s source/ldid.hpp
+          if grep -nE '\bsprintf\(' source/ldid.cpp; then
+            echo "ERROR: deprecated sprintf remains in ldid.cpp" >&2
+            exit 1
+          fi
           mkdir -p source/libplist_include source/libplist_lib
           mkdir -p source/openssl_include source/openssl_lib
           mkdir -p third_party/curl third_party/curl-headers
@@ -123,9 +175,16 @@ jobs:
           cd "${WS}/build-deps/openssl-src"
 
           export IPHONEOS_DEPLOYMENT_TARGET="${IOS_DEPLOYMENT_TARGET}"
+          export CROSS_TOP="${WS}/build-deps/ios-cross-root"
+          export CROSS_SDK="iPhoneOS${IOS_SDK_VERSION}.sdk"
+          export CROSS_COMPILE="$(xcode-select -p)/Toolchains/XcodeDefault.xctoolchain/usr/bin/"
+          mkdir -p "${CROSS_TOP}/SDKs"
+          ln -sfn "${SDK}" "${CROSS_TOP}/SDKs/${CROSS_SDK}"
+          export PATH="${CROSS_COMPILE}:${PATH}"
           export CFLAGS="${OPT_CFLAGS} ${LTO_CFLAGS} -arch arm64 -isysroot ${SDK} -miphoneos-version-min=${IOS_DEPLOYMENT_TARGET}"
+          echo "OpenSSL SDK=${CROSS_TOP}/SDKs/${CROSS_SDK}"
           echo "OpenSSL CFLAGS=${CFLAGS}"
-          ./Configure ios64-xcrun \
+          ./Configure ios64-cross \
             no-shared no-tests no-apps no-dso no-async \
             --prefix="${PREFIX}" \
             --openssldir="${PREFIX}/ssl" \
@@ -478,6 +537,12 @@ jobs:
           xcrun lipo -info "${BINARY}"
           xcrun otool -hv "${BINARY}"
           xcrun otool -L "${BINARY}"
+          BUILD_INFO="$(xcrun vtool -show-build "${BINARY}")"
+          printf '%s\n' "${BUILD_INFO}"
+          if ! grep -Eq 'sdk[[:space:]]+16\.5([[:space:]]|$)' <<<"${BUILD_INFO}"; then
+            echo "ERROR: final ldid binary was not linked against the iOS 16.5 SDK" >&2
+            exit 1
+          fi
 
           if xcrun otool -L "${BINARY}" | grep -E 'lib(crypto|ssl|curl|archive|plist|lzma|zstd|bz2)[^/]*\\.dylib'; then
             echo "ERROR: a third-party dependency was linked dynamically" >&2
