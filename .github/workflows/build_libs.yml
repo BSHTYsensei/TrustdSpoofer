@@ -76,8 +76,15 @@ jobs:
           test -f "${SDK}/usr/lib/libz.tbd"
           test -d "${SDK}/System/Library/Frameworks/Security.framework"
           echo "Pinned SDK contents:"
-          /usr/libexec/PlistBuddy -c 'Print :Version' "${SDK}/SDKSettings.plist" || true
+          SDK_METADATA_VERSION="$(/usr/libexec/PlistBuddy -c 'Print :Version' "${SDK}/SDKSettings.plist" | tr -d '[:space:]')"
+          if [[ -z "${SDK_METADATA_VERSION}" ]]; then
+            echo "ERROR: SDKSettings.plist has no Version value" >&2
+            exit 1
+          fi
+          echo "SDK archive directory: iPhoneOS${IOS_SDK_VERSION}.sdk"
+          echo "SDKSettings.plist Version: ${SDK_METADATA_VERSION}"
           echo "IOS_SDK_PATH=${SDK}" >> "${GITHUB_ENV}"
+          echo "SDK_METADATA_VERSION=${SDK_METADATA_VERSION}" >> "${GITHUB_ENV}"
           echo "IOS_CC=$(xcrun --find clang)" >> "${GITHUB_ENV}"
           echo "IOS_CXX=$(xcrun --find clang++)" >> "${GITHUB_ENV}"
           echo "IOS_AR=$(xcrun --find ar)" >> "${GITHUB_ENV}"
@@ -540,10 +547,14 @@ jobs:
           BUILD_INFO="$(xcrun vtool -show-build "${BINARY}")"
           printf '%s\n' "${BUILD_INFO}"
 
-          # vtool/Xcode versions may print the same SDK as either 16.5 or
-          # 16.5.0. Parse the SDK field rather than relying on a substring grep.
+          # The Theos SDK archive is named iPhoneOS16.5.sdk, but Apple’s
+          # iOS 16.5 release notes specify that development uses the iOS 16.4 SDK.
+          # Therefore the Mach-O LC_BUILD_VERSION sdk field is expected to match
+          # SDKSettings.plist :Version, not the archive directory's name.
           SDK_RECORDED="$(awk '$1 == "sdk" { print $2; exit }' <<<"${BUILD_INFO}")"
           PLATFORM_RECORDED="$(awk '$1 == "platform" { print $2; exit }' <<<"${BUILD_INFO}")"
+          echo "SDK archive directory: iPhoneOS${IOS_SDK_VERSION}.sdk"
+          echo "SDKSettings.plist Version: ${SDK_METADATA_VERSION:-<missing>}"
           echo "Recorded Mach-O platform: ${PLATFORM_RECORDED:-<missing>}"
           echo "Recorded Mach-O SDK version: ${SDK_RECORDED:-<missing>}"
 
@@ -551,14 +562,21 @@ jobs:
             echo "ERROR: final ldid binary does not record the iOS device platform (got '${PLATFORM_RECORDED:-missing}')" >&2
             exit 1
           fi
-          case "${SDK_RECORDED}" in
-            16.5|16.5.0) ;;
-            *)
-              echo "ERROR: final ldid binary must record iOS 16.5 SDK (16.5 or 16.5.0); got '${SDK_RECORDED:-missing}'" >&2
-              echo "The compiler command uses IOS_SDK_PATH=${IOS_SDK_PATH}; inspect the SDKSettings.plist Version and clang driver's -platform_version arguments if this still fails." >&2
-              exit 1
-              ;;
-          esac
+          normalize_sdk_version() {
+            local version="$1"
+            if [[ "${version}" =~ ^([0-9]+\.[0-9]+)(\.0)?$ ]]; then
+              printf '%s\n' "${BASH_REMATCH[1]}"
+            else
+              printf '%s\n' "${version}"
+            fi
+          }
+          EXPECTED_SDK_RECORDED="$(normalize_sdk_version "${SDK_METADATA_VERSION:-}")"
+          ACTUAL_SDK_RECORDED="$(normalize_sdk_version "${SDK_RECORDED:-}")"
+          if [[ -z "${SDK_METADATA_VERSION:-}" || -z "${SDK_RECORDED:-}" || "${ACTUAL_SDK_RECORDED}" != "${EXPECTED_SDK_RECORDED}" ]]; then
+            echo "ERROR: Mach-O SDK metadata '${SDK_RECORDED:-missing}' does not match the selected iPhoneOS${IOS_SDK_VERSION}.sdk metadata '${SDK_METADATA_VERSION:-missing}'" >&2
+            echo "The SDK archive SHA-256 was verified during download; the compiler uses IOS_SDK_PATH=${IOS_SDK_PATH}." >&2
+            exit 1
+          fi
 
           if xcrun otool -L "${BINARY}" | grep -E 'lib(crypto|ssl|curl|archive|plist|lzma|zstd|bz2)[^/]*\\.dylib'; then
             echo "ERROR: a third-party dependency was linked dynamically" >&2
