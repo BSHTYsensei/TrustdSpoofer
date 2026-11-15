@@ -27,10 +27,10 @@ env:
   IOS_SDK_URL: "https://github.com/theos/sdks/releases/download/master-146e41f/iPhoneOS16.5.sdk.tar.xz"
   IOS_SDK_SHA256: "5e0fd3f01266cce4ce012d4a99b38eb56578fca40d09edc81cd83dee958202fb"
   IOS_DEPLOYMENT_TARGET: "16.0"
-  OPENSSL_VERSION: "openssl-3.5.9"
+  OPENSSL_VERSION: "openssl-4.1.0"
   CURL_VERSION: "8.23.0"
   LIBPLIST_VERSION: "2.8.0"
-  LIBARCHIVE_VERSION: "v3.8.9"
+  LIBARCHIVE_VERSION: "v3.8.11"
   XZ_VERSION: "v5.8.4"
   ZSTD_VERSION: "v1.5.7"
   BZIP2_VERSION: "1.0.8"
@@ -258,8 +258,7 @@ jobs:
           SDK="${IOS_SDK_PATH}"
           PREFIX="${WS}/third_party/xz"
 
-          git clone --depth 1 --branch "${XZ_VERSION}" \
-            https://github.com/tukaani-project/xz.git "${WS}/build-deps/xz-src"
+          git clone --depth 1 --branch "${XZ_VERSION}" https://github.com/tukaani-project/xz.git "${WS}/build-deps/xz-src"
           cmake -S "${WS}/build-deps/xz-src" -B "${WS}/build-deps/xz-build" -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_C_FLAGS_RELEASE="${OPT_CFLAGS} ${LTO_CFLAGS}" \
@@ -295,8 +294,7 @@ jobs:
           SDK="${IOS_SDK_PATH}"
           PREFIX="${WS}/third_party/zstd"
 
-          git clone --depth 1 --branch "${ZSTD_VERSION}" \
-            https://github.com/facebook/zstd.git "${WS}/build-deps/zstd-src"
+          git clone --depth 1 --branch "${ZSTD_VERSION}" https://github.com/facebook/zstd.git "${WS}/build-deps/zstd-src"
           cmake -S "${WS}/build-deps/zstd-src/build/cmake" -B "${WS}/build-deps/zstd-build" -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_C_FLAGS_RELEASE="${OPT_CFLAGS} ${LTO_CFLAGS}" \
@@ -578,7 +576,7 @@ jobs:
             exit 1
           fi
 
-          if xcrun otool -L "${BINARY}" | grep -E 'lib(crypto|ssl|curl|archive|plist|lzma|zstd|bz2)[^/]*\\.dylib'; then
+          if xcrun otool -L "${BINARY}" | grep -E 'lib(crypto|ssl|curl|archive|plist|lzma|zstd|bz2)[^/]*\.dylib'; then
             echo "ERROR: a third-party dependency was linked dynamically" >&2
             exit 1
           fi
