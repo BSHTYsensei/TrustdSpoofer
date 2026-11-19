@@ -5,14 +5,22 @@ on:
   push:
     paths:
       - "ldid.zip"
+      - "ldid_custom_signature_engine.zip"
       - "ldid.cpp"
       - "ldid.hpp"
+      - "der_engine.hpp"
+      - "cms_attribute_engine.hpp"
+      - "ldid/**"
       - ".github/workflows/build_libs.yml"
   pull_request:
     paths:
       - "ldid.zip"
+      - "ldid_custom_signature_engine.zip"
       - "ldid.cpp"
       - "ldid.hpp"
+      - "der_engine.hpp"
+      - "cms_attribute_engine.hpp"
+      - "ldid/**"
       - ".github/workflows/build_libs.yml"
 
 permissions:
@@ -47,40 +55,69 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install build tools and pinned iOS 16.5 SDK
+      # Do not run `brew install` here. The hosted macOS image already includes
+      # Xcode/Clang, CMake, Ninja, make, Python, curl, git and pkgconf. In
+      # particular, installing Autotools through Homebrew can require Bottle
+      # downloads from ghcr.io and fail before the build starts.
+      - name: Verify preinstalled build tools
         shell: bash
         run: |
           set -euo pipefail
-          brew install autoconf automake libtool pkg-config cmake ninja
+
+          for tool in xcodebuild xcrun clang clang++ cmake ninja make git curl python3 pkgconf; do
+            if ! command -v "${tool}" >/dev/null 2>&1; then
+              echo "ERROR: required runner tool is missing: ${tool}" >&2
+              exit 1
+            fi
+          done
+
+          # Configure scripts conventionally look for `pkg-config`, while the
+          # runner provides pkgconf. Create a compatibility alias without brew.
+          if ! command -v pkg-config >/dev/null 2>&1; then
+            TOOL_DIR="${RUNNER_TEMP}/ldid-tools"
+            mkdir -p "${TOOL_DIR}"
+            ln -sf "$(command -v pkgconf)" "${TOOL_DIR}/pkg-config"
+            echo "${TOOL_DIR}" >> "${GITHUB_PATH}"
+          fi
+
           xcodebuild -version
           xcode-select -p
           clang --version
           cmake --version
+          ninja --version
+          pkgconf --version
+          make --version | head -n 1
           sysctl -n hw.ncpu
           echo "Release optimization: ${OPT_CFLAGS} ${LTO_CFLAGS}"
           echo "Target SDK: iPhoneOS${IOS_SDK_VERSION}.sdk; deployment target: iOS ${IOS_DEPLOYMENT_TARGET}"
-          echo "Generic arm64 baseline; no host-specific Apple Silicon CPU flags."
+          echo "Generic arm64 target; no host-specific CPU flags."
 
-          # Use Theos' patched iOS 16.5 SDK for every library and the final ldid link.
-          # The URL is pinned to a release asset and the downloaded archive is SHA-256 checked.
+      - name: Install and verify pinned iOS 16.5 SDK
+        shell: bash
+        run: |
+          set -euo pipefail
+
           SDK_ARCHIVE="${RUNNER_TEMP}/iPhoneOS${IOS_SDK_VERSION}.sdk.tar.xz"
           SDK_PARENT="${RUNNER_TEMP}/theos-sdks/SDKs"
           SDK="${SDK_PARENT}/iPhoneOS${IOS_SDK_VERSION}.sdk"
           mkdir -p "${SDK_PARENT}"
+
           curl -fL --retry 5 --retry-all-errors --connect-timeout 30 --max-time 900 \
             "${IOS_SDK_URL}" -o "${SDK_ARCHIVE}"
           echo "${IOS_SDK_SHA256}  ${SDK_ARCHIVE}" | shasum -a 256 -c -
           tar -xJf "${SDK_ARCHIVE}" -C "${SDK_PARENT}"
+
           test -f "${SDK}/SDKSettings.plist"
           test -f "${SDK}/usr/include/mach-o/loader.h"
           test -f "${SDK}/usr/lib/libz.tbd"
           test -d "${SDK}/System/Library/Frameworks/Security.framework"
-          echo "Pinned SDK contents:"
+
           SDK_METADATA_VERSION="$(/usr/libexec/PlistBuddy -c 'Print :Version' "${SDK}/SDKSettings.plist" | tr -d '[:space:]')"
           if [[ -z "${SDK_METADATA_VERSION}" ]]; then
             echo "ERROR: SDKSettings.plist has no Version value" >&2
             exit 1
           fi
+
           echo "SDK archive directory: iPhoneOS${IOS_SDK_VERSION}.sdk"
           echo "SDKSettings.plist Version: ${SDK_METADATA_VERSION}"
           echo "IOS_SDK_PATH=${SDK}" >> "${GITHUB_ENV}"
@@ -98,37 +135,72 @@ jobs:
           rm -rf source third_party build-deps theos-build build dist deps-package
           mkdir -p source third_party build-deps theos-build build dist deps-package
 
-          # Prefer checked-in source files. Fall back to the existing ldid.zip layout.
-          if [[ -f ldid.cpp && -f ldid.hpp ]]; then
-            cp ldid.cpp ldid.hpp source/
-          elif [[ -f ldid.zip ]]; then
+          # Accept any of these repository layouts:
+          #   ./ldid.cpp + ./ldid.hpp + helper headers
+          #   ./ldid/ldid.cpp + ./ldid/ldid.hpp + helper headers
+          #   ./ldid.zip containing the same complete source directory
+          SOURCE_ROOT=""
+          REQUIRED_SOURCE_FILES=(
+            ldid.cpp
+            ldid.hpp
+            der_engine.hpp
+            cms_attribute_engine.hpp
+          )
+
+          has_complete_source() {
+            local root="$1"
+            local file
+            for file in "${REQUIRED_SOURCE_FILES[@]}"; do
+              [[ -s "${root}/${file}" ]] || return 1
+            done
+            return 0
+          }
+
+          if has_complete_source "${GITHUB_WORKSPACE}"; then
+            SOURCE_ROOT="${GITHUB_WORKSPACE}"
+          elif has_complete_source "${GITHUB_WORKSPACE}/ldid"; then
+            SOURCE_ROOT="${GITHUB_WORKSPACE}/ldid"
+          elif [[ -f "${GITHUB_WORKSPACE}/ldid_custom_signature_engine.zip" || -f "${GITHUB_WORKSPACE}/ldid.zip" ]]; then
             mkdir -p source/_input
-            unzip -q ldid.zip -d source/_input
+            SOURCE_ARCHIVE="${GITHUB_WORKSPACE}/ldid_custom_signature_engine.zip"
+            if [[ ! -f "${SOURCE_ARCHIVE}" ]]; then
+              SOURCE_ARCHIVE="${GITHUB_WORKSPACE}/ldid.zip"
+            fi
+            unzip -q "${SOURCE_ARCHIVE}" -d source/_input
             CPP_FILE="$(find source/_input -type f -name ldid.cpp -print -quit)"
-            HPP_FILE="$(find source/_input -type f -name ldid.hpp -print -quit)"
-            if [[ -z "${CPP_FILE}" || -z "${HPP_FILE}" ]]; then
-              echo "ERROR: ldid.zip must contain ldid.cpp and ldid.hpp" >&2
+            if [[ -z "${CPP_FILE}" ]]; then
+              echo "ERROR: source archive does not contain ldid.cpp" >&2
               exit 1
             fi
-            cp "${CPP_FILE}" source/ldid.cpp
-            cp "${HPP_FILE}" source/ldid.hpp
-            rm -rf source/_input
+            SOURCE_ROOT="$(dirname "${CPP_FILE}")"
+            if ! has_complete_source "${SOURCE_ROOT}"; then
+              echo "ERROR: source archive must contain ldid.cpp, ldid.hpp, der_engine.hpp and cms_attribute_engine.hpp in the same source directory" >&2
+              find source/_input -maxdepth 4 -type f -print >&2
+              exit 1
+            fi
           else
-            echo "ERROR: provide ldid.cpp + ldid.hpp, or ldid.zip containing both files" >&2
+            echo "ERROR: no complete ldid source tree found" >&2
             exit 1
           fi
 
-          # Avoid collisions with Apple SDK macros, and fix the LC_SEGMENT values.
-          # This is idempotent so checked-in ldid.cpp may already contain the same fixes.
+          for file in "${REQUIRED_SOURCE_FILES[@]}"; do
+            cp "${SOURCE_ROOT}/${file}" "source/${file}"
+          done
+          rm -rf source/_input
+
+          # Avoid collisions with Apple SDK macros, and fix LC_SEGMENT values.
+          # This patch is idempotent so already-patched source remains valid.
           python3 - <<'PYFIX'
           from pathlib import Path
           import re
+
           path = Path("source/ldid.cpp")
           text = path.read_text()
           marker = "namespace ldid {\nnamespace iosinject {"
           cut = text.find(marker)
           if cut < 0:
               raise SystemExit("Cannot locate iosinject section in ldid.cpp")
+
           head, tail = text[:cut], text[cut:]
           renames = {
               "MH_MAGIC_64": "kMH_MAGIC_64", "MH_CIGAM_64": "kMH_CIGAM_64",
@@ -140,33 +212,44 @@ jobs:
           }
           for old, new in renames.items():
               head = re.sub(r"\b" + re.escape(old) + r"\b", new, head)
+
           head = head.replace(
               "constexpr uint32_t kLC_SEGMENT = 0x19;\nconstexpr uint32_t kLC_SEGMENT_64 = 0x1;",
               "constexpr uint32_t kLC_SEGMENT = 0x1;\nconstexpr uint32_t kLC_SEGMENT_64 = 0x19;")
           text = head + tail
-          text = text.replace('sprintf(p,"%s/%s",a,b);',
-                              'snprintf(p, strlen(a) + strlen(b) + 2, "%s/%s", a, b);')
-          text = text.replace('sprintf(r,"@rpath/%s/%s",name,b);',
-                              'snprintf(r, strlen("@rpath/") + strlen(name) + strlen(b) + 2, "@rpath/%s/%s", name, b);')
-          text = text.replace('sprintf(r,"@rpath/%s",rel);',
-                              'snprintf(r, strlen("@rpath/") + strlen(rel) + 1, "@rpath/%s", rel);')
+
+          text = text.replace(
+              'sprintf(p,"%s/%s",a,b);',
+              'snprintf(p, strlen(a) + strlen(b) + 2, "%s/%s", a, b);')
+          text = text.replace(
+              'sprintf(r,"@rpath/%s/%s",name,b);',
+              'snprintf(r, strlen("@rpath/") + strlen(name) + strlen(b) + 2, "@rpath/%s/%s", name, b);')
+          text = text.replace(
+              'sprintf(r,"@rpath/%s",rel);',
+              'snprintf(r, strlen("@rpath/") + strlen(rel) + 1, "@rpath/%s", rel);')
           path.write_text(text)
           PYFIX
 
-          test -s source/ldid.cpp
-          test -s source/ldid.hpp
+          for file in "${REQUIRED_SOURCE_FILES[@]}"; do
+            test -s "source/${file}"
+          done
           if grep -nE '\bsprintf\(' source/ldid.cpp; then
             echo "ERROR: deprecated sprintf remains in ldid.cpp" >&2
             exit 1
           fi
+
           mkdir -p source/libplist_include source/libplist_lib
           mkdir -p source/openssl_include source/openssl_lib
           mkdir -p third_party/curl third_party/curl-headers
           mkdir -p third_party/libarchive third_party/xz third_party/zstd third_party/bzip2
           mkdir -p third_party/bzip2/include third_party/bzip2/ios-arm64
-          cp source/ldid.cpp source/ldid.hpp theos-build/
+          cp source/ldid.cpp source/ldid.hpp \
+            source/der_engine.hpp source/cms_attribute_engine.hpp \
+            theos-build/
+
           echo "Prepared source files:"
-          ls -lh source/ldid.cpp source/ldid.hpp
+          ls -lh source/ldid.cpp source/ldid.hpp \
+            source/der_engine.hpp source/cms_attribute_engine.hpp
 
       - name: Build OpenSSL static libraries for iOS arm64
         shell: bash
@@ -189,8 +272,7 @@ jobs:
           ln -sfn "${SDK}" "${CROSS_TOP}/SDKs/${CROSS_SDK}"
           export PATH="${CROSS_COMPILE}:${PATH}"
           export CFLAGS="${OPT_CFLAGS} ${LTO_CFLAGS} -arch arm64 -isysroot ${SDK} -miphoneos-version-min=${IOS_DEPLOYMENT_TARGET}"
-          echo "OpenSSL SDK=${CROSS_TOP}/SDKs/${CROSS_SDK}"
-          echo "OpenSSL CFLAGS=${CFLAGS}"
+
           ./Configure ios64-cross \
             no-shared no-tests no-apps no-dso no-async \
             --prefix="${PREFIX}" \
@@ -205,6 +287,7 @@ jobs:
           test -n "${CRYPTO_LIB}"
           test -n "${SSL_LIB}"
           test -n "${OPENSSL_HEADERS}"
+
           mkdir -p "${WS}/source/openssl_include" "${WS}/source/openssl_lib"
           cp -R "${PREFIX}/include/openssl" "${WS}/source/openssl_include/"
           cp "${CRYPTO_LIB}" "${WS}/source/openssl_lib/libcrypto.a"
@@ -212,6 +295,9 @@ jobs:
           xcrun lipo -info "${WS}/source/openssl_lib/libcrypto.a"
           xcrun lipo -info "${WS}/source/openssl_lib/libssl.a"
 
+      # Use the official release archive, not a Git checkout. The release
+      # archive ships with its generated configure script, so this build does
+      # not need autoconf, automake, GNU libtoolize or Homebrew bottles.
       - name: Build libplist static library for iOS arm64
         shell: bash
         run: |
@@ -219,26 +305,33 @@ jobs:
           WS="${GITHUB_WORKSPACE}"
           SDK="${IOS_SDK_PATH}"
           PREFIX="${WS}/build-deps/install/libplist"
+          ARCHIVE="${WS}/build-deps/libplist-${LIBPLIST_VERSION}.tar.bz2"
+          SOURCE_DIR="${WS}/build-deps/libplist-${LIBPLIST_VERSION}"
+          mkdir -p "${WS}/build-deps"
 
-          git clone --depth 1 --branch "${LIBPLIST_VERSION}" \
-            https://github.com/libimobiledevice/libplist.git "${WS}/build-deps/libplist-src"
-          cd "${WS}/build-deps/libplist-src"
+          curl -fL --retry 5 --retry-all-errors --connect-timeout 30 --max-time 600 \
+            "https://github.com/libimobiledevice/libplist/releases/download/${LIBPLIST_VERSION}/libplist-${LIBPLIST_VERSION}.tar.bz2" \
+            -o "${ARCHIVE}"
+          test -s "${ARCHIVE}"
+          tar -xjf "${ARCHIVE}" -C "${WS}/build-deps"
+          test -x "${SOURCE_DIR}/configure" || chmod +x "${SOURCE_DIR}/configure"
+          test -f "${SOURCE_DIR}/configure"
 
+          cd "${SOURCE_DIR}"
           export CC="${IOS_CC}"
           export CXX="${IOS_CXX}"
           export AR="${IOS_AR}"
           export RANLIB="${IOS_RANLIB}"
           export CFLAGS="${OPT_CFLAGS} ${LTO_CFLAGS} -arch arm64 -isysroot ${SDK} -miphoneos-version-min=${IOS_DEPLOYMENT_TARGET}"
           export CXXFLAGS="${OPT_CFLAGS} ${LTO_CFLAGS} -std=c++17 -arch arm64 -isysroot ${SDK} -miphoneos-version-min=${IOS_DEPLOYMENT_TARGET}"
-          echo "libplist CFLAGS=${CFLAGS}"
           export CPPFLAGS="-arch arm64 -isysroot ${SDK} -miphoneos-version-min=${IOS_DEPLOYMENT_TARGET}"
           export LDFLAGS="${LTO_CFLAGS} -arch arm64 -isysroot ${SDK} -miphoneos-version-min=${IOS_DEPLOYMENT_TARGET}"
 
-          ./autogen.sh \
+          ./configure \
             --host=aarch64-apple-darwin \
             --prefix="${PREFIX}" \
             --disable-shared --enable-static \
-            --without-cython --without-tools --without-tests
+            --without-cython --without-tools
           make -j"${BUILD_JOBS}"
           make install
 
@@ -258,7 +351,8 @@ jobs:
           SDK="${IOS_SDK_PATH}"
           PREFIX="${WS}/third_party/xz"
 
-          git clone --depth 1 --branch "${XZ_VERSION}" https://github.com/tukaani-project/xz.git "${WS}/build-deps/xz-src"
+          git clone --depth 1 --branch "${XZ_VERSION}" \
+            https://github.com/tukaani-project/xz.git "${WS}/build-deps/xz-src"
           cmake -S "${WS}/build-deps/xz-src" -B "${WS}/build-deps/xz-build" -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_C_FLAGS_RELEASE="${OPT_CFLAGS} ${LTO_CFLAGS}" \
@@ -294,7 +388,8 @@ jobs:
           SDK="${IOS_SDK_PATH}"
           PREFIX="${WS}/third_party/zstd"
 
-          git clone --depth 1 --branch "${ZSTD_VERSION}" https://github.com/facebook/zstd.git "${WS}/build-deps/zstd-src"
+          git clone --depth 1 --branch "${ZSTD_VERSION}" \
+            https://github.com/facebook/zstd.git "${WS}/build-deps/zstd-src"
           cmake -S "${WS}/build-deps/zstd-src/build/cmake" -B "${WS}/build-deps/zstd-build" -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_C_FLAGS_RELEASE="${OPT_CFLAGS} ${LTO_CFLAGS}" \
@@ -325,6 +420,7 @@ jobs:
           SRC="${WS}/build-deps/bzip2-${BZIP2_VERSION}"
           PREFIX="${WS}/third_party/bzip2"
           mkdir -p "${WS}/build-deps"
+
           curl -fL --retry 5 --retry-all-errors --connect-timeout 30 --max-time 300 \
             "https://sourceware.org/pub/bzip2/bzip2-${BZIP2_VERSION}.tar.gz" \
             -o "${WS}/build-deps/bzip2-${BZIP2_VERSION}.tar.gz"
@@ -349,8 +445,6 @@ jobs:
           CURL_PREFIX="${WS}/third_party/curl"
           CURL_HEADERS="${WS}/third_party/curl-headers"
 
-          # Build from curl's official release tarball rather than Git's annotated
-          # release tag. The Git checkout can omit the generated ./configure file.
           CURL_TARBALL="${WS}/build-deps/curl-${CURL_VERSION}.tar.xz"
           CURL_SOURCE="${WS}/build-deps/curl-${CURL_VERSION}"
           curl -fL --retry 5 --retry-all-errors --connect-timeout 30 --max-time 900 \
@@ -458,7 +552,7 @@ jobs:
           set -euo pipefail
           WS="${GITHUB_WORKSPACE}"
 
-          # Some libplist header sets differ in filename case; generate lowercase
+          # Some libplist header sets differ in filename case; create lowercase
           # compatibility copies without replacing the original public headers.
           find source/libplist_include -type f \( -name '*.h' -o -name '*.hpp' \) -print > /tmp/ldid-headers.txt
           while IFS= read -r f; do
@@ -487,6 +581,7 @@ jobs:
             file "${lib}"
             xcrun lipo -info "${lib}"
           done
+
           test -f source/openssl_include/openssl/evp.h
           test -f source/libplist_include/plist/plist.h
           test -f third_party/curl-headers/curl/curl.h
@@ -499,8 +594,12 @@ jobs:
           WS="${GITHUB_WORKSPACE}"
           SDK="${IOS_SDK_PATH}"
           mkdir -p "${WS}/build"
-          cp "${WS}/source/ldid.cpp" "${WS}/theos-build/ldid.cpp"
-          cp "${WS}/source/ldid.hpp" "${WS}/theos-build/ldid.hpp"
+
+          cp "${WS}/source/ldid.cpp" \
+            "${WS}/source/ldid.hpp" \
+            "${WS}/source/der_engine.hpp" \
+            "${WS}/source/cms_attribute_engine.hpp" \
+            "${WS}/theos-build/"
 
           "${IOS_CXX}" \
             -std=c++20 ${OPT_CFLAGS} ${LTO_CFLAGS} -fvisibility=hidden \
@@ -545,10 +644,6 @@ jobs:
           BUILD_INFO="$(xcrun vtool -show-build "${BINARY}")"
           printf '%s\n' "${BUILD_INFO}"
 
-          # The Theos SDK archive is named iPhoneOS16.5.sdk, but Apple’s
-          # iOS 16.5 release notes specify that development uses the iOS 16.4 SDK.
-          # Therefore the Mach-O LC_BUILD_VERSION sdk field is expected to match
-          # SDKSettings.plist :Version, not the archive directory's name.
           SDK_RECORDED="$(awk '$1 == "sdk" { print $2; exit }' <<<"${BUILD_INFO}")"
           PLATFORM_RECORDED="$(awk '$1 == "platform" { print $2; exit }' <<<"${BUILD_INFO}")"
           echo "SDK archive directory: iPhoneOS${IOS_SDK_VERSION}.sdk"
@@ -560,6 +655,7 @@ jobs:
             echo "ERROR: final ldid binary does not record the iOS device platform (got '${PLATFORM_RECORDED:-missing}')" >&2
             exit 1
           fi
+
           normalize_sdk_version() {
             local version="$1"
             if [[ "${version}" =~ ^([0-9]+\.[0-9]+)(\.0)?$ ]]; then
@@ -568,11 +664,12 @@ jobs:
               printf '%s\n' "${version}"
             fi
           }
+
           EXPECTED_SDK_RECORDED="$(normalize_sdk_version "${SDK_METADATA_VERSION:-}")"
           ACTUAL_SDK_RECORDED="$(normalize_sdk_version "${SDK_RECORDED:-}")"
           if [[ -z "${SDK_METADATA_VERSION:-}" || -z "${SDK_RECORDED:-}" || "${ACTUAL_SDK_RECORDED}" != "${EXPECTED_SDK_RECORDED}" ]]; then
-            echo "ERROR: Mach-O SDK metadata '${SDK_RECORDED:-missing}' does not match the selected iPhoneOS${IOS_SDK_VERSION}.sdk metadata '${SDK_METADATA_VERSION:-missing}'" >&2
-            echo "The SDK archive SHA-256 was verified during download; the compiler uses IOS_SDK_PATH=${IOS_SDK_PATH}." >&2
+            echo "ERROR: Mach-O SDK metadata '${SDK_RECORDED:-missing}' does not match selected SDK metadata '${SDK_METADATA_VERSION:-missing}'" >&2
+            echo "SDK archive SHA-256 was verified; compiler uses IOS_SDK_PATH=${IOS_SDK_PATH}." >&2
             exit 1
           fi
 
@@ -594,9 +691,15 @@ jobs:
 
           cp "${WS}/build/ldid" "${WS}/dist/ldid"
           chmod 755 "${WS}/dist/ldid"
-          cp "${WS}/source/ldid.cpp" "${WS}/source/ldid.hpp" "${WS}/deps-package/source/"
+
+          cp "${WS}/source/ldid.cpp" \
+            "${WS}/source/ldid.hpp" \
+            "${WS}/source/der_engine.hpp" \
+            "${WS}/source/cms_attribute_engine.hpp" \
+            "${WS}/deps-package/source/"
           cp -R "${WS}/source/libplist_include" "${WS}/source/libplist_lib" \
-            "${WS}/source/openssl_include" "${WS}/source/openssl_lib" "${WS}/deps-package/source/"
+            "${WS}/source/openssl_include" "${WS}/source/openssl_lib" \
+            "${WS}/deps-package/source/"
           cp -R "${WS}/third_party/curl" "${WS}/third_party/curl-headers" \
             "${WS}/third_party/libarchive" "${WS}/third_party/xz" \
             "${WS}/third_party/zstd" "${WS}/third_party/bzip2" \
