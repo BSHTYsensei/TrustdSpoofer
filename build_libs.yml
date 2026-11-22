@@ -1,0 +1,701 @@
+name: Build iOS ldid and static dependencies
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "ldid.zip"
+      - "ldid.cpp"
+      - "ldid.hpp"
+      - "ldid/**"
+      - "tests/**"
+      - "README.md"
+      - ".github/workflows/build_libs.yml"
+  pull_request:
+    paths:
+      - "ldid.zip"
+      - "ldid.cpp"
+      - "ldid.hpp"
+      - "ldid/**"
+      - "tests/**"
+      - "README.md"
+      - ".github/workflows/build_libs.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-ldid-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  IOS_SDK_VERSION: "16.5"
+  IOS_SDK_URL: "https://github.com/theos/sdks/releases/download/master-146e41f/iPhoneOS16.5.sdk.tar.xz"
+  IOS_SDK_SHA256: "5e0fd3f01266cce4ce012d4a99b38eb56578fca40d09edc81cd83dee958202fb"
+  IOS_DEPLOYMENT_TARGET: "16.0"
+  OPENSSL_VERSION: "openssl-4.1.0"
+  CURL_VERSION: "8.23.0"
+  LIBPLIST_VERSION: "2.8.0"
+  LIBARCHIVE_VERSION: "v3.8.11"
+  XZ_VERSION: "v5.8.4"
+  ZSTD_VERSION: "v1.5.7"
+  BZIP2_VERSION: "1.0.8"
+  OPT_CFLAGS: "-O3 -DNDEBUG -ffunction-sections -fdata-sections"
+  LTO_CFLAGS: "-flto=thin"
+
+jobs:
+  build-ios-arm64:
+    name: iOS device arm64 / static dependencies
+    runs-on: macos-15
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Do not run `brew install` here. The hosted macOS image already includes
+      # Xcode/Clang, CMake, Ninja, make, Python, curl, git and pkgconf. In
+      # particular, installing Autotools through Homebrew can require Bottle
+      # downloads from ghcr.io and fail before the build starts.
+      - name: Verify preinstalled build tools
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          for tool in xcodebuild xcrun clang clang++ cmake ninja make git curl python3 pkgconf; do
+            if ! command -v "${tool}" >/dev/null 2>&1; then
+              echo "ERROR: required runner tool is missing: ${tool}" >&2
+              exit 1
+            fi
+          done
+
+          # Configure scripts conventionally look for `pkg-config`, while the
+          # runner provides pkgconf. Create a compatibility alias without brew.
+          if ! command -v pkg-config >/dev/null 2>&1; then
+            TOOL_DIR="${RUNNER_TEMP}/ldid-tools"
+            mkdir -p "${TOOL_DIR}"
+            ln -sf "$(command -v pkgconf)" "${TOOL_DIR}/pkg-config"
+            echo "${TOOL_DIR}" >> "${GITHUB_PATH}"
+          fi
+
+          xcodebuild -version
+          xcode-select -p
+          clang --version
+          cmake --version
+          ninja --version
+          pkgconf --version
+          make --version | head -n 1
+          sysctl -n hw.ncpu
+          echo "Release optimization: ${OPT_CFLAGS} ${LTO_CFLAGS}"
+          echo "Target SDK: iPhoneOS${IOS_SDK_VERSION}.sdk; deployment target: iOS ${IOS_DEPLOYMENT_TARGET}"
+          echo "Generic arm64 target; no host-specific CPU flags."
+
+      - name: Install and verify pinned iOS 16.5 SDK
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          SDK_ARCHIVE="${RUNNER_TEMP}/iPhoneOS${IOS_SDK_VERSION}.sdk.tar.xz"
+          SDK_PARENT="${RUNNER_TEMP}/theos-sdks/SDKs"
+          SDK="${SDK_PARENT}/iPhoneOS${IOS_SDK_VERSION}.sdk"
+          mkdir -p "${SDK_PARENT}"
+
+          curl -fL --retry 5 --retry-all-errors --connect-timeout 30 --max-time 900 \
+            "${IOS_SDK_URL}" -o "${SDK_ARCHIVE}"
+          echo "${IOS_SDK_SHA256}  ${SDK_ARCHIVE}" | shasum -a 256 -c -
+          tar -xJf "${SDK_ARCHIVE}" -C "${SDK_PARENT}"
+
+          test -f "${SDK}/SDKSettings.plist"
+          test -f "${SDK}/usr/include/mach-o/loader.h"
+          test -f "${SDK}/usr/lib/libz.tbd"
+          test -d "${SDK}/System/Library/Frameworks/Security.framework"
+
+          SDK_METADATA_VERSION="$(/usr/libexec/PlistBuddy -c 'Print :Version' "${SDK}/SDKSettings.plist" | tr -d '[:space:]')"
+          if [[ -z "${SDK_METADATA_VERSION}" ]]; then
+            echo "ERROR: SDKSettings.plist has no Version value" >&2
+            exit 1
+          fi
+
+          echo "SDK archive directory: iPhoneOS${IOS_SDK_VERSION}.sdk"
+          echo "SDKSettings.plist Version: ${SDK_METADATA_VERSION}"
+          echo "IOS_SDK_PATH=${SDK}" >> "${GITHUB_ENV}"
+          echo "SDK_METADATA_VERSION=${SDK_METADATA_VERSION}" >> "${GITHUB_ENV}"
+          echo "IOS_CC=$(xcrun --find clang)" >> "${GITHUB_ENV}"
+          echo "IOS_CXX=$(xcrun --find clang++)" >> "${GITHUB_ENV}"
+          echo "IOS_AR=$(xcrun --find ar)" >> "${GITHUB_ENV}"
+          echo "IOS_RANLIB=$(xcrun --find ranlib)" >> "${GITHUB_ENV}"
+          echo "BUILD_JOBS=$(sysctl -n hw.ncpu)" >> "${GITHUB_ENV}"
+
+      - name: Prepare source tree and output directories
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf source third_party build-deps theos-build build dist deps-package
+          mkdir -p source third_party build-deps theos-build build dist deps-package
+
+          # Accept any of these repository layouts:
+          #   ./ldid.cpp + ./ldid.hpp
+          #   ./ldid/ldid.cpp + ./ldid/ldid.hpp
+          #   ./ldid.zip containing the same two-file source package
+          SOURCE_ROOT=""
+          REQUIRED_SOURCE_FILES=(
+            ldid.cpp
+            ldid.hpp
+          )
+
+          has_complete_source() {
+            local root="$1"
+            local file
+            for file in "${REQUIRED_SOURCE_FILES[@]}"; do
+              [[ -s "${root}/${file}" ]] || return 1
+            done
+            return 0
+          }
+
+          if has_complete_source "${GITHUB_WORKSPACE}"; then
+            SOURCE_ROOT="${GITHUB_WORKSPACE}"
+          elif has_complete_source "${GITHUB_WORKSPACE}/ldid"; then
+            SOURCE_ROOT="${GITHUB_WORKSPACE}/ldid"
+          elif [[ -f "${GITHUB_WORKSPACE}/ldid.zip" ]]; then
+            mkdir -p source/_input
+            SOURCE_ARCHIVE="${GITHUB_WORKSPACE}/ldid.zip"
+            unzip -q "${SOURCE_ARCHIVE}" -d source/_input
+            CPP_FILE="$(find source/_input -type f -name ldid.cpp -print -quit)"
+            if [[ -z "${CPP_FILE}" ]]; then
+              echo "ERROR: source archive does not contain ldid.cpp" >&2
+              exit 1
+            fi
+            SOURCE_ROOT="$(dirname "${CPP_FILE}")"
+            if ! has_complete_source "${SOURCE_ROOT}"; then
+              echo "ERROR: source archive must contain ldid.cpp and ldid.hpp in the same source directory" >&2
+              find source/_input -maxdepth 4 -type f -print >&2
+              exit 1
+            fi
+          else
+            echo "ERROR: no complete ldid source tree found" >&2
+            exit 1
+          fi
+
+          for file in "${REQUIRED_SOURCE_FILES[@]}"; do
+            cp "${SOURCE_ROOT}/${file}" "source/${file}"
+          done
+
+          # Bring the regression test with the source package when building from ldid.zip.
+          if [[ "${SOURCE_ROOT}" != "${GITHUB_WORKSPACE}" && -f "${SOURCE_ROOT}/tests/ldid_source_checks.py" ]]; then
+            mkdir -p tests
+            cp "${SOURCE_ROOT}/tests/ldid_source_checks.py" tests/ldid_source_checks.py
+          fi
+          rm -rf source/_input
+
+          for file in "${REQUIRED_SOURCE_FILES[@]}"; do
+            test -s "source/${file}"
+          done
+          if grep -nE '^#include [<"](der_engine|cms_attribute_engine)\.hpp' source/ldid.cpp; then
+            echo "ERROR: legacy helper-header include remains in ldid.cpp" >&2
+            exit 1
+          fi
+
+          mkdir -p source/libplist_include source/libplist_lib
+          mkdir -p source/openssl_include source/openssl_lib
+          mkdir -p third_party/curl third_party/curl-headers
+          mkdir -p third_party/libarchive third_party/xz third_party/zstd third_party/bzip2
+          mkdir -p third_party/bzip2/include third_party/bzip2/ios-arm64
+          cp source/ldid.cpp source/ldid.hpp theos-build/
+
+          echo "Prepared source files:"
+          ls -lh source/ldid.cpp source/ldid.hpp
+
+      - name: Run source regression tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 tests/ldid_source_checks.py \
+            --source-dir "${GITHUB_WORKSPACE}/source" \
+            --workflow "${GITHUB_WORKSPACE}/.github/workflows/build_libs.yml" \
+            --compiler clang++
+
+      - name: Build OpenSSL static libraries for iOS arm64
+        shell: bash
+        run: |
+          set -euo pipefail
+          WS="${GITHUB_WORKSPACE}"
+          SDK="${IOS_SDK_PATH}"
+          PREFIX="${WS}/build-deps/install/openssl"
+          mkdir -p "${WS}/build-deps/install"
+
+          git clone --depth 1 --branch "${OPENSSL_VERSION}" \
+            https://github.com/openssl/openssl.git "${WS}/build-deps/openssl-src"
+          cd "${WS}/build-deps/openssl-src"
+
+          export IPHONEOS_DEPLOYMENT_TARGET="${IOS_DEPLOYMENT_TARGET}"
+          export CROSS_TOP="${WS}/build-deps/ios-cross-root"
+          export CROSS_SDK="iPhoneOS${IOS_SDK_VERSION}.sdk"
+          export CROSS_COMPILE="$(xcode-select -p)/Toolchains/XcodeDefault.xctoolchain/usr/bin/"
+          mkdir -p "${CROSS_TOP}/SDKs"
+          ln -sfn "${SDK}" "${CROSS_TOP}/SDKs/${CROSS_SDK}"
+          export PATH="${CROSS_COMPILE}:${PATH}"
+          export CFLAGS="${OPT_CFLAGS} ${LTO_CFLAGS} -arch arm64 -isysroot ${SDK} -miphoneos-version-min=${IOS_DEPLOYMENT_TARGET}"
+
+          ./Configure ios64-cross \
+            no-shared no-tests no-apps no-dso no-async \
+            --prefix="${PREFIX}" \
+            --openssldir="${PREFIX}/ssl" \
+            --libdir=lib
+          make -j"${BUILD_JOBS}"
+          make install_sw
+
+          CRYPTO_LIB="$(find "${PREFIX}" -type f -name libcrypto.a -print -quit)"
+          SSL_LIB="$(find "${PREFIX}" -type f -name libssl.a -print -quit)"
+          OPENSSL_HEADERS="$(find "${PREFIX}/include" -type f -path '*/openssl/evp.h' -print -quit)"
+          test -n "${CRYPTO_LIB}"
+          test -n "${SSL_LIB}"
+          test -n "${OPENSSL_HEADERS}"
+
+          mkdir -p "${WS}/source/openssl_include" "${WS}/source/openssl_lib"
+          cp -R "${PREFIX}/include/openssl" "${WS}/source/openssl_include/"
+          cp "${CRYPTO_LIB}" "${WS}/source/openssl_lib/libcrypto.a"
+          cp "${SSL_LIB}" "${WS}/source/openssl_lib/libssl.a"
+          xcrun lipo -info "${WS}/source/openssl_lib/libcrypto.a"
+          xcrun lipo -info "${WS}/source/openssl_lib/libssl.a"
+
+      # Use the official release archive, not a Git checkout. The release
+      # archive ships with its generated configure script, so this build does
+      # not need autoconf, automake, GNU libtoolize or Homebrew bottles.
+      - name: Build libplist static library for iOS arm64
+        shell: bash
+        run: |
+          set -euo pipefail
+          WS="${GITHUB_WORKSPACE}"
+          SDK="${IOS_SDK_PATH}"
+          PREFIX="${WS}/build-deps/install/libplist"
+          ARCHIVE="${WS}/build-deps/libplist-${LIBPLIST_VERSION}.tar.bz2"
+          SOURCE_DIR="${WS}/build-deps/libplist-${LIBPLIST_VERSION}"
+          mkdir -p "${WS}/build-deps"
+
+          curl -fL --retry 5 --retry-all-errors --connect-timeout 30 --max-time 600 \
+            "https://github.com/libimobiledevice/libplist/releases/download/${LIBPLIST_VERSION}/libplist-${LIBPLIST_VERSION}.tar.bz2" \
+            -o "${ARCHIVE}"
+          test -s "${ARCHIVE}"
+          tar -xjf "${ARCHIVE}" -C "${WS}/build-deps"
+          test -x "${SOURCE_DIR}/configure" || chmod +x "${SOURCE_DIR}/configure"
+          test -f "${SOURCE_DIR}/configure"
+
+          cd "${SOURCE_DIR}"
+          export CC="${IOS_CC}"
+          export CXX="${IOS_CXX}"
+          export AR="${IOS_AR}"
+          export RANLIB="${IOS_RANLIB}"
+          export CFLAGS="${OPT_CFLAGS} ${LTO_CFLAGS} -arch arm64 -isysroot ${SDK} -miphoneos-version-min=${IOS_DEPLOYMENT_TARGET}"
+          export CXXFLAGS="${OPT_CFLAGS} ${LTO_CFLAGS} -std=c++17 -arch arm64 -isysroot ${SDK} -miphoneos-version-min=${IOS_DEPLOYMENT_TARGET}"
+          export CPPFLAGS="-arch arm64 -isysroot ${SDK} -miphoneos-version-min=${IOS_DEPLOYMENT_TARGET}"
+          export LDFLAGS="${LTO_CFLAGS} -arch arm64 -isysroot ${SDK} -miphoneos-version-min=${IOS_DEPLOYMENT_TARGET}"
+
+          ./configure \
+            --host=aarch64-apple-darwin \
+            --prefix="${PREFIX}" \
+            --disable-shared --enable-static \
+            --without-cython --without-tools
+          make -j"${BUILD_JOBS}"
+          make install
+
+          PLIST_LIB="$(find "${PREFIX}/lib" -type f -name 'libplist-2.0.a' -print -quit)"
+          test -n "${PLIST_LIB}"
+          test -f "${PREFIX}/include/plist/plist.h"
+          mkdir -p "${WS}/source/libplist_include" "${WS}/source/libplist_lib"
+          cp -R "${PREFIX}/include/." "${WS}/source/libplist_include/"
+          cp "${PLIST_LIB}" "${WS}/source/libplist_lib/libplist-2.0.a"
+          xcrun lipo -info "${WS}/source/libplist_lib/libplist-2.0.a"
+
+      - name: Build XZ liblzma static library for iOS arm64
+        shell: bash
+        run: |
+          set -euo pipefail
+          WS="${GITHUB_WORKSPACE}"
+          SDK="${IOS_SDK_PATH}"
+          PREFIX="${WS}/third_party/xz"
+
+          git clone --depth 1 --branch "${XZ_VERSION}" \
+            https://github.com/tukaani-project/xz.git "${WS}/build-deps/xz-src"
+          cmake -S "${WS}/build-deps/xz-src" -B "${WS}/build-deps/xz-build" -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_FLAGS_RELEASE="${OPT_CFLAGS} ${LTO_CFLAGS}" \
+            -DCMAKE_CXX_FLAGS_RELEASE="${OPT_CFLAGS} ${LTO_CFLAGS}" \
+            -DCMAKE_SYSTEM_NAME=iOS \
+            -DCMAKE_OSX_SYSROOT="${SDK}" \
+            -DCMAKE_OSX_ARCHITECTURES=arm64 \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET="${IOS_DEPLOYMENT_TARGET}" \
+            -DCMAKE_INSTALL_PREFIX="${PREFIX}" \
+            -DCMAKE_INSTALL_LIBDIR=ios-arm64 \
+            -DCMAKE_INSTALL_INCLUDEDIR=include \
+            -DBUILD_SHARED_LIBS=OFF \
+            -DBUILD_TESTING=OFF \
+            -DXZ_NLS=OFF \
+            -DXZ_TOOL_XZ=OFF \
+            -DXZ_TOOL_XZDEC=OFF \
+            -DXZ_TOOL_LZMADEC=OFF \
+            -DXZ_TOOL_LZMAINFO=OFF \
+            -DXZ_TOOL_SYMLINKS=OFF \
+            -DXZ_TOOL_SYMLINKS_LZMA=OFF \
+            -DXZ_TOOL_SCRIPTS=OFF
+          cmake --build "${WS}/build-deps/xz-build" --parallel "${BUILD_JOBS}"
+          cmake --install "${WS}/build-deps/xz-build"
+          test -f "${PREFIX}/ios-arm64/liblzma.a"
+          test -f "${PREFIX}/include/lzma.h"
+          xcrun lipo -info "${PREFIX}/ios-arm64/liblzma.a"
+
+      - name: Build Zstandard static library for iOS arm64
+        shell: bash
+        run: |
+          set -euo pipefail
+          WS="${GITHUB_WORKSPACE}"
+          SDK="${IOS_SDK_PATH}"
+          PREFIX="${WS}/third_party/zstd"
+
+          git clone --depth 1 --branch "${ZSTD_VERSION}" \
+            https://github.com/facebook/zstd.git "${WS}/build-deps/zstd-src"
+          cmake -S "${WS}/build-deps/zstd-src/build/cmake" -B "${WS}/build-deps/zstd-build" -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_FLAGS_RELEASE="${OPT_CFLAGS} ${LTO_CFLAGS}" \
+            -DCMAKE_CXX_FLAGS_RELEASE="${OPT_CFLAGS} ${LTO_CFLAGS}" \
+            -DCMAKE_SYSTEM_NAME=iOS \
+            -DCMAKE_OSX_SYSROOT="${SDK}" \
+            -DCMAKE_OSX_ARCHITECTURES=arm64 \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET="${IOS_DEPLOYMENT_TARGET}" \
+            -DCMAKE_INSTALL_PREFIX="${PREFIX}" \
+            -DCMAKE_INSTALL_LIBDIR=ios-arm64 \
+            -DCMAKE_INSTALL_INCLUDEDIR=include \
+            -DZSTD_BUILD_STATIC=ON \
+            -DZSTD_BUILD_SHARED=OFF \
+            -DZSTD_BUILD_TESTS=OFF \
+            -DZSTD_MULTITHREAD_SUPPORT=OFF
+          cmake --build "${WS}/build-deps/zstd-build" --parallel "${BUILD_JOBS}"
+          cmake --install "${WS}/build-deps/zstd-build"
+          test -f "${PREFIX}/ios-arm64/libzstd.a"
+          test -f "${PREFIX}/include/zstd.h"
+          xcrun lipo -info "${PREFIX}/ios-arm64/libzstd.a"
+
+      - name: Build BZip2 static library for iOS arm64
+        shell: bash
+        run: |
+          set -euo pipefail
+          WS="${GITHUB_WORKSPACE}"
+          SDK="${IOS_SDK_PATH}"
+          SRC="${WS}/build-deps/bzip2-${BZIP2_VERSION}"
+          PREFIX="${WS}/third_party/bzip2"
+          mkdir -p "${WS}/build-deps"
+
+          curl -fL --retry 5 --retry-all-errors --connect-timeout 30 --max-time 300 \
+            "https://sourceware.org/pub/bzip2/bzip2-${BZIP2_VERSION}.tar.gz" \
+            -o "${WS}/build-deps/bzip2-${BZIP2_VERSION}.tar.gz"
+          tar -xzf "${WS}/build-deps/bzip2-${BZIP2_VERSION}.tar.gz" -C "${WS}/build-deps"
+
+          make -C "${SRC}" clean || true
+          make -C "${SRC}" -j"${BUILD_JOBS}" libbz2.a \
+            CC="${IOS_CC}" AR="${IOS_AR}" RANLIB="${IOS_RANLIB}" \
+            CFLAGS="${OPT_CFLAGS} ${LTO_CFLAGS} -D_FILE_OFFSET_BITS=64 -arch arm64 -isysroot ${SDK} -miphoneos-version-min=${IOS_DEPLOYMENT_TARGET}"
+          cp "${SRC}/bzlib.h" "${PREFIX}/include/"
+          cp "${SRC}/libbz2.a" "${PREFIX}/ios-arm64/libbz2.a"
+          test -s "${PREFIX}/include/bzlib.h"
+          xcrun lipo -info "${PREFIX}/ios-arm64/libbz2.a"
+
+      - name: Build libcurl static library for iOS arm64
+        shell: bash
+        run: |
+          set -euo pipefail
+          WS="${GITHUB_WORKSPACE}"
+          SDK="${IOS_SDK_PATH}"
+          OPENSSL_PREFIX="${WS}/build-deps/install/openssl"
+          CURL_PREFIX="${WS}/third_party/curl"
+          CURL_HEADERS="${WS}/third_party/curl-headers"
+
+          CURL_TARBALL="${WS}/build-deps/curl-${CURL_VERSION}.tar.xz"
+          CURL_SOURCE="${WS}/build-deps/curl-${CURL_VERSION}"
+          curl -fL --retry 5 --retry-all-errors --connect-timeout 30 --max-time 900 \
+            "https://curl.se/download/curl-${CURL_VERSION}.tar.xz" \
+            -o "${CURL_TARBALL}"
+          test -s "${CURL_TARBALL}"
+          tar -xJf "${CURL_TARBALL}" -C "${WS}/build-deps"
+          test -f "${CURL_SOURCE}/configure"
+          test -f "${CURL_SOURCE}/include/curl/curl.h"
+          chmod +x "${CURL_SOURCE}/configure"
+          cd "${CURL_SOURCE}"
+
+          export CC="${IOS_CC}"
+          export AR="${IOS_AR}"
+          export RANLIB="${IOS_RANLIB}"
+          export CFLAGS="${OPT_CFLAGS} ${LTO_CFLAGS} -arch arm64 -isysroot ${SDK} -miphoneos-version-min=${IOS_DEPLOYMENT_TARGET}"
+          export CPPFLAGS="-I${OPENSSL_PREFIX}/include -arch arm64 -isysroot ${SDK} -miphoneos-version-min=${IOS_DEPLOYMENT_TARGET}"
+          export LDFLAGS="${LTO_CFLAGS} -L${OPENSSL_PREFIX}/lib -arch arm64 -isysroot ${SDK} -miphoneos-version-min=${IOS_DEPLOYMENT_TARGET} -framework Security -framework CoreFoundation -framework SystemConfiguration"
+
+          ./configure \
+            --host=aarch64-apple-darwin \
+            --prefix="${CURL_PREFIX}" \
+            --libdir="${CURL_PREFIX}/ios-arm64" \
+            --includedir="${CURL_HEADERS}" \
+            --disable-shared --enable-static \
+            --with-openssl="${OPENSSL_PREFIX}" \
+            --with-apple-sectrust --enable-ca-native \
+            --without-zlib --without-brotli --without-zstd --without-libpsl \
+            --disable-ldap --disable-ldaps \
+            --disable-ftp --disable-file --disable-rtsp --disable-dict \
+            --disable-telnet --disable-tftp --disable-pop3 --disable-imap \
+            --disable-smb --disable-gopher --disable-mqtt \
+            --disable-docs --disable-manual
+          make -j"${BUILD_JOBS}"
+          make install
+
+          test -f "${CURL_PREFIX}/ios-arm64/libcurl.a"
+          test -f "${CURL_HEADERS}/curl/curl.h"
+          xcrun lipo -info "${CURL_PREFIX}/ios-arm64/libcurl.a"
+
+      - name: Build libarchive static library for iOS arm64
+        shell: bash
+        run: |
+          set -euo pipefail
+          WS="${GITHUB_WORKSPACE}"
+          SDK="${IOS_SDK_PATH}"
+          PREFIX="${WS}/third_party/libarchive"
+          XZ_PREFIX="${WS}/third_party/xz"
+          ZSTD_PREFIX="${WS}/third_party/zstd"
+          BZIP2_PREFIX="${WS}/third_party/bzip2"
+
+          git clone --depth 1 --branch "${LIBARCHIVE_VERSION}" \
+            https://github.com/libarchive/libarchive.git "${WS}/build-deps/libarchive-src"
+          cmake -S "${WS}/build-deps/libarchive-src" -B "${WS}/build-deps/libarchive-build" -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_FLAGS_RELEASE="${OPT_CFLAGS} ${LTO_CFLAGS}" \
+            -DCMAKE_CXX_FLAGS_RELEASE="${OPT_CFLAGS} ${LTO_CFLAGS}" \
+            -DCMAKE_SYSTEM_NAME=iOS \
+            -DCMAKE_MACOSX_BUNDLE=OFF \
+            -DCMAKE_OSX_SYSROOT="${SDK}" \
+            -DCMAKE_OSX_ARCHITECTURES=arm64 \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET="${IOS_DEPLOYMENT_TARGET}" \
+            -DCMAKE_INSTALL_PREFIX="${PREFIX}" \
+            -DCMAKE_INSTALL_LIBDIR=ios-arm64 \
+            -DCMAKE_INSTALL_INCLUDEDIR=include \
+            -DBUILD_SHARED_LIBS=OFF \
+            -DENABLE_INSTALL=ON \
+            -DENABLE_TEST=OFF \
+            -DENABLE_TAR=OFF \
+            -DENABLE_CPIO=OFF \
+            -DENABLE_CAT=OFF \
+            -DENABLE_UNZIP=OFF \
+            -DENABLE_OPENSSL=OFF \
+            -DENABLE_LIBXML2=OFF \
+            -DENABLE_BSDXML=OFF \
+            -DENABLE_EXPAT=OFF \
+            -DENABLE_LZ4=OFF \
+            -DENABLE_LZO=OFF \
+            -DENABLE_LIBB2=OFF \
+            -DENABLE_LZMA=ON \
+            -DENABLE_ZSTD=ON \
+            -DENABLE_BZip2=ON \
+            -DENABLE_ZLIB=ON \
+            -DLIBLZMA_INCLUDE_DIR="${XZ_PREFIX}/include" \
+            -DLIBLZMA_LIBRARY="${XZ_PREFIX}/ios-arm64/liblzma.a" \
+            -DZSTD_INCLUDE_DIR="${ZSTD_PREFIX}/include" \
+            -DZSTD_LIBRARY="${ZSTD_PREFIX}/ios-arm64/libzstd.a" \
+            -DBZIP2_INCLUDE_DIR="${BZIP2_PREFIX}/include" \
+            -DBZIP2_LIBRARY="${BZIP2_PREFIX}/ios-arm64/libbz2.a" \
+            -DBZIP2_LIBRARY_RELEASE="${BZIP2_PREFIX}/ios-arm64/libbz2.a" \
+            -DZLIB_INCLUDE_DIR="${SDK}/usr/include" \
+            -DZLIB_LIBRARY="${SDK}/usr/lib/libz.tbd" \
+            -DZLIB_LIBRARY_RELEASE="${SDK}/usr/lib/libz.tbd"
+          cmake --build "${WS}/build-deps/libarchive-build" --parallel "${BUILD_JOBS}"
+          cmake --install "${WS}/build-deps/libarchive-build"
+
+          test -f "${PREFIX}/ios-arm64/libarchive.a"
+          test -f "${PREFIX}/include/archive.h"
+          test -f "${PREFIX}/include/archive_entry.h"
+          xcrun lipo -info "${PREFIX}/ios-arm64/libarchive.a"
+
+      - name: Normalize dependency headers and verify static library architectures
+        shell: bash
+        run: |
+          set -euo pipefail
+          WS="${GITHUB_WORKSPACE}"
+
+          # Some libplist header sets differ in filename case; create lowercase
+          # compatibility copies without replacing the original public headers.
+          find source/libplist_include -type f \( -name '*.h' -o -name '*.hpp' \) -print > /tmp/ldid-headers.txt
+          while IFS= read -r f; do
+            [[ -z "${f}" ]] && continue
+            dir="$(dirname "${f}")"
+            base="$(basename "${f}")"
+            lower="$(printf '%s' "${base}" | tr 'A-Z' 'a-z')"
+            if [[ "${base}" != "${lower}" && ! -e "${dir}/${lower}" ]]; then
+              cp "${f}" "${dir}/${lower}"
+            fi
+          done < /tmp/ldid-headers.txt
+
+          required=(
+            source/openssl_lib/libcrypto.a
+            source/openssl_lib/libssl.a
+            source/libplist_lib/libplist-2.0.a
+            third_party/curl/ios-arm64/libcurl.a
+            third_party/libarchive/ios-arm64/libarchive.a
+            third_party/xz/ios-arm64/liblzma.a
+            third_party/zstd/ios-arm64/libzstd.a
+            third_party/bzip2/ios-arm64/libbz2.a
+          )
+          for lib in "${required[@]}"; do
+            test -s "${lib}"
+            echo "===== ${lib} ====="
+            file "${lib}"
+            xcrun lipo -info "${lib}"
+          done
+
+          test -f source/openssl_include/openssl/evp.h
+          test -f source/libplist_include/plist/plist.h
+          test -f third_party/curl-headers/curl/curl.h
+          test -f third_party/libarchive/include/archive.h
+
+      - name: iOS arm64 syntax-only compile
+        shell: bash
+        run: |
+          set -euo pipefail
+          WS="${GITHUB_WORKSPACE}"
+          SDK="${IOS_SDK_PATH}"
+          "${IOS_CXX}" \
+            -std=c++20 -fsyntax-only ${OPT_CFLAGS} -fvisibility=hidden \
+            -target "arm64-apple-ios${IOS_DEPLOYMENT_TARGET}" \
+            -isysroot "${SDK}" \
+            -I"${WS}/source/libplist_include" \
+            -I"${WS}/source/openssl_include" \
+            -I"${WS}/third_party/curl-headers" \
+            -I"${WS}/third_party/libarchive/include" \
+            -I"${WS}/third_party/xz/include" \
+            -I"${WS}/third_party/zstd/include" \
+            -I"${WS}/third_party/bzip2/include" \
+            "${WS}/source/ldid.cpp"
+
+      - name: Compile ldid for iOS arm64
+        shell: bash
+        run: |
+          set -euo pipefail
+          WS="${GITHUB_WORKSPACE}"
+          SDK="${IOS_SDK_PATH}"
+          mkdir -p "${WS}/build"
+
+          cp "${WS}/source/ldid.cpp" "${WS}/source/ldid.hpp" "${WS}/theos-build/"
+
+          "${IOS_CXX}" \
+            -std=c++20 ${OPT_CFLAGS} ${LTO_CFLAGS} -fvisibility=hidden \
+            -target "arm64-apple-ios${IOS_DEPLOYMENT_TARGET}" \
+            -isysroot "${SDK}" \
+            -I"${WS}/source/libplist_include" \
+            -I"${WS}/source/openssl_include" \
+            -I"${WS}/third_party/curl-headers" \
+            -I"${WS}/third_party/libarchive/include" \
+            -I"${WS}/third_party/xz/include" \
+            -I"${WS}/third_party/zstd/include" \
+            -I"${WS}/third_party/bzip2/include" \
+            "${WS}/theos-build/ldid.cpp" \
+            "${WS}/third_party/curl/ios-arm64/libcurl.a" \
+            "${WS}/third_party/libarchive/ios-arm64/libarchive.a" \
+            "${WS}/source/libplist_lib/libplist-2.0.a" \
+            "${WS}/source/openssl_lib/libssl.a" \
+            "${WS}/source/openssl_lib/libcrypto.a" \
+            "${WS}/third_party/xz/ios-arm64/liblzma.a" \
+            "${WS}/third_party/zstd/ios-arm64/libzstd.a" \
+            "${WS}/third_party/bzip2/ios-arm64/libbz2.a" \
+            -framework Security \
+            -framework CoreFoundation \
+            -framework SystemConfiguration \
+            -framework CFNetwork \
+            -framework Foundation \
+            -lxml2 -liconv -lz \
+            -Wl,-dead_strip -Wl,-dead_strip_dylibs -Wl,-undefined,error \
+            -o "${WS}/build/ldid"
+          chmod 755 "${WS}/build/ldid"
+
+      - name: Validate final Mach-O and link dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          BINARY="${GITHUB_WORKSPACE}/build/ldid"
+          test -x "${BINARY}"
+          file "${BINARY}"
+          xcrun lipo -info "${BINARY}"
+          xcrun otool -hv "${BINARY}"
+          xcrun otool -L "${BINARY}"
+          BUILD_INFO="$(xcrun vtool -show-build "${BINARY}")"
+          printf '%s\n' "${BUILD_INFO}"
+
+          SDK_RECORDED="$(awk '$1 == "sdk" { print $2; exit }' <<<"${BUILD_INFO}")"
+          PLATFORM_RECORDED="$(awk '$1 == "platform" { print $2; exit }' <<<"${BUILD_INFO}")"
+          echo "SDK archive directory: iPhoneOS${IOS_SDK_VERSION}.sdk"
+          echo "SDKSettings.plist Version: ${SDK_METADATA_VERSION:-<missing>}"
+          echo "Recorded Mach-O platform: ${PLATFORM_RECORDED:-<missing>}"
+          echo "Recorded Mach-O SDK version: ${SDK_RECORDED:-<missing>}"
+
+          if [[ "${PLATFORM_RECORDED}" != "IOS" ]]; then
+            echo "ERROR: final ldid binary does not record the iOS device platform (got '${PLATFORM_RECORDED:-missing}')" >&2
+            exit 1
+          fi
+
+          normalize_sdk_version() {
+            local version="$1"
+            if [[ "${version}" =~ ^([0-9]+\.[0-9]+)(\.0)?$ ]]; then
+              printf '%s\n' "${BASH_REMATCH[1]}"
+            else
+              printf '%s\n' "${version}"
+            fi
+          }
+
+          EXPECTED_SDK_RECORDED="$(normalize_sdk_version "${SDK_METADATA_VERSION:-}")"
+          ACTUAL_SDK_RECORDED="$(normalize_sdk_version "${SDK_RECORDED:-}")"
+          if [[ -z "${SDK_METADATA_VERSION:-}" || -z "${SDK_RECORDED:-}" || "${ACTUAL_SDK_RECORDED}" != "${EXPECTED_SDK_RECORDED}" ]]; then
+            echo "ERROR: Mach-O SDK metadata '${SDK_RECORDED:-missing}' does not match selected SDK metadata '${SDK_METADATA_VERSION:-missing}'" >&2
+            echo "SDK archive SHA-256 was verified; compiler uses IOS_SDK_PATH=${IOS_SDK_PATH}." >&2
+            exit 1
+          fi
+
+          if xcrun otool -L "${BINARY}" | grep -E 'lib(crypto|ssl|curl|archive|plist|lzma|zstd|bz2)[^/]*\.dylib'; then
+            echo "ERROR: a third-party dependency was linked dynamically" >&2
+            exit 1
+          fi
+          if xcrun nm -u "${BINARY}" | grep -E '(_EVP_|_PKCS7_|_X509_|_curl_easy_|_archive_read_|_plist_)'; then
+            echo "ERROR: unresolved third-party symbols remain" >&2
+            exit 1
+          fi
+
+      - name: Package binary and rebuilt dependency tree
+        shell: bash
+        run: |
+          set -euo pipefail
+          WS="${GITHUB_WORKSPACE}"
+          mkdir -p "${WS}/dist" "${WS}/deps-package/source" "${WS}/deps-package/third_party"
+
+          cp "${WS}/build/ldid" "${WS}/dist/ldid"
+          chmod 755 "${WS}/dist/ldid"
+
+          cp "${WS}/source/ldid.cpp" "${WS}/source/ldid.hpp" "${WS}/deps-package/source/"
+          cp -R "${WS}/source/libplist_include" "${WS}/source/libplist_lib" \
+            "${WS}/source/openssl_include" "${WS}/source/openssl_lib" \
+            "${WS}/deps-package/source/"
+          cp -R "${WS}/third_party/curl" "${WS}/third_party/curl-headers" \
+            "${WS}/third_party/libarchive" "${WS}/third_party/xz" \
+            "${WS}/third_party/zstd" "${WS}/third_party/bzip2" \
+            "${WS}/deps-package/third_party/"
+
+          cd "${WS}/dist"
+          zip -9 -q ldid-ios-arm64.zip ldid
+          shasum -a 256 ldid ldid-ios-arm64.zip
+          ls -lh ldid ldid-ios-arm64.zip
+
+          cd "${WS}/deps-package"
+          zip -9 -qr "${WS}/dist/ldid-ios-arm64-dependencies.zip" source third_party
+          shasum -a 256 "${WS}/dist/ldid-ios-arm64-dependencies.zip"
+          ls -lh "${WS}/dist/ldid-ios-arm64-dependencies.zip"
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ldid-ios-arm64
+          path: |
+            dist/ldid
+            dist/ldid-ios-arm64.zip
+            dist/ldid-ios-arm64-dependencies.zip
+          if-no-files-found: error
+          retention-days: 14
