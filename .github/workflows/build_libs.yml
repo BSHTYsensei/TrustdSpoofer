@@ -5,22 +5,20 @@ on:
   push:
     paths:
       - "ldid.zip"
-      - "ldid_custom_signature_engine.zip"
       - "ldid.cpp"
       - "ldid.hpp"
-      - "der_engine.hpp"
-      - "cms_attribute_engine.hpp"
       - "ldid/**"
+      - "tests/**"
+      - "README.md"
       - ".github/workflows/build_libs.yml"
   pull_request:
     paths:
       - "ldid.zip"
-      - "ldid_custom_signature_engine.zip"
       - "ldid.cpp"
       - "ldid.hpp"
-      - "der_engine.hpp"
-      - "cms_attribute_engine.hpp"
       - "ldid/**"
+      - "tests/**"
+      - "README.md"
       - ".github/workflows/build_libs.yml"
 
 permissions:
@@ -136,15 +134,13 @@ jobs:
           mkdir -p source third_party build-deps theos-build build dist deps-package
 
           # Accept any of these repository layouts:
-          #   ./ldid.cpp + ./ldid.hpp + helper headers
-          #   ./ldid/ldid.cpp + ./ldid/ldid.hpp + helper headers
-          #   ./ldid.zip containing the same complete source directory
+          #   ./ldid.cpp + ./ldid.hpp
+          #   ./ldid/ldid.cpp + ./ldid/ldid.hpp
+          #   ./ldid.zip containing the same two-file source package
           SOURCE_ROOT=""
           REQUIRED_SOURCE_FILES=(
             ldid.cpp
             ldid.hpp
-            der_engine.hpp
-            cms_attribute_engine.hpp
           )
 
           has_complete_source() {
@@ -160,12 +156,9 @@ jobs:
             SOURCE_ROOT="${GITHUB_WORKSPACE}"
           elif has_complete_source "${GITHUB_WORKSPACE}/ldid"; then
             SOURCE_ROOT="${GITHUB_WORKSPACE}/ldid"
-          elif [[ -f "${GITHUB_WORKSPACE}/ldid_custom_signature_engine.zip" || -f "${GITHUB_WORKSPACE}/ldid.zip" ]]; then
+          elif [[ -f "${GITHUB_WORKSPACE}/ldid.zip" ]]; then
             mkdir -p source/_input
-            SOURCE_ARCHIVE="${GITHUB_WORKSPACE}/ldid_custom_signature_engine.zip"
-            if [[ ! -f "${SOURCE_ARCHIVE}" ]]; then
-              SOURCE_ARCHIVE="${GITHUB_WORKSPACE}/ldid.zip"
-            fi
+            SOURCE_ARCHIVE="${GITHUB_WORKSPACE}/ldid.zip"
             unzip -q "${SOURCE_ARCHIVE}" -d source/_input
             CPP_FILE="$(find source/_input -type f -name ldid.cpp -print -quit)"
             if [[ -z "${CPP_FILE}" ]]; then
@@ -174,7 +167,7 @@ jobs:
             fi
             SOURCE_ROOT="$(dirname "${CPP_FILE}")"
             if ! has_complete_source "${SOURCE_ROOT}"; then
-              echo "ERROR: source archive must contain ldid.cpp, ldid.hpp, der_engine.hpp and cms_attribute_engine.hpp in the same source directory" >&2
+              echo "ERROR: source archive must contain ldid.cpp and ldid.hpp in the same source directory" >&2
               find source/_input -maxdepth 4 -type f -print >&2
               exit 1
             fi
@@ -186,55 +179,19 @@ jobs:
           for file in "${REQUIRED_SOURCE_FILES[@]}"; do
             cp "${SOURCE_ROOT}/${file}" "source/${file}"
           done
+
+          # Bring the regression test with the source package when building from ldid.zip.
+          if [[ "${SOURCE_ROOT}" != "${GITHUB_WORKSPACE}" && -f "${SOURCE_ROOT}/tests/ldid_source_checks.py" ]]; then
+            mkdir -p tests
+            cp "${SOURCE_ROOT}/tests/ldid_source_checks.py" tests/ldid_source_checks.py
+          fi
           rm -rf source/_input
-
-          # Avoid collisions with Apple SDK macros, and fix LC_SEGMENT values.
-          # This patch is idempotent so already-patched source remains valid.
-          python3 - <<'PYFIX'
-          from pathlib import Path
-          import re
-
-          path = Path("source/ldid.cpp")
-          text = path.read_text()
-          marker = "namespace ldid {\nnamespace iosinject {"
-          cut = text.find(marker)
-          if cut < 0:
-              raise SystemExit("Cannot locate iosinject section in ldid.cpp")
-
-          head, tail = text[:cut], text[cut:]
-          renames = {
-              "MH_MAGIC_64": "kMH_MAGIC_64", "MH_CIGAM_64": "kMH_CIGAM_64",
-              "MH_MAGIC": "kMH_MAGIC", "MH_CIGAM": "kMH_CIGAM",
-              "FAT_MAGIC_64": "kFAT_MAGIC_64", "FAT_CIGAM_64": "kFAT_CIGAM_64",
-              "FAT_MAGIC": "kFAT_MAGIC", "FAT_CIGAM": "kFAT_CIGAM",
-              "LC_SEGMENT_64": "kLC_SEGMENT_64", "LC_SEGMENT": "kLC_SEGMENT",
-              "LC_CODE_SIGNATURE": "kLC_CODE_SIGNATURE",
-          }
-          for old, new in renames.items():
-              head = re.sub(r"\b" + re.escape(old) + r"\b", new, head)
-
-          head = head.replace(
-              "constexpr uint32_t kLC_SEGMENT = 0x19;\nconstexpr uint32_t kLC_SEGMENT_64 = 0x1;",
-              "constexpr uint32_t kLC_SEGMENT = 0x1;\nconstexpr uint32_t kLC_SEGMENT_64 = 0x19;")
-          text = head + tail
-
-          text = text.replace(
-              'sprintf(p,"%s/%s",a,b);',
-              'snprintf(p, strlen(a) + strlen(b) + 2, "%s/%s", a, b);')
-          text = text.replace(
-              'sprintf(r,"@rpath/%s/%s",name,b);',
-              'snprintf(r, strlen("@rpath/") + strlen(name) + strlen(b) + 2, "@rpath/%s/%s", name, b);')
-          text = text.replace(
-              'sprintf(r,"@rpath/%s",rel);',
-              'snprintf(r, strlen("@rpath/") + strlen(rel) + 1, "@rpath/%s", rel);')
-          path.write_text(text)
-          PYFIX
 
           for file in "${REQUIRED_SOURCE_FILES[@]}"; do
             test -s "source/${file}"
           done
-          if grep -nE '\bsprintf\(' source/ldid.cpp; then
-            echo "ERROR: deprecated sprintf remains in ldid.cpp" >&2
+          if grep -nE '^#include [<"](der_engine|cms_attribute_engine)\.hpp' source/ldid.cpp; then
+            echo "ERROR: legacy helper-header include remains in ldid.cpp" >&2
             exit 1
           fi
 
@@ -243,13 +200,19 @@ jobs:
           mkdir -p third_party/curl third_party/curl-headers
           mkdir -p third_party/libarchive third_party/xz third_party/zstd third_party/bzip2
           mkdir -p third_party/bzip2/include third_party/bzip2/ios-arm64
-          cp source/ldid.cpp source/ldid.hpp \
-            source/der_engine.hpp source/cms_attribute_engine.hpp \
-            theos-build/
+          cp source/ldid.cpp source/ldid.hpp theos-build/
 
           echo "Prepared source files:"
-          ls -lh source/ldid.cpp source/ldid.hpp \
-            source/der_engine.hpp source/cms_attribute_engine.hpp
+          ls -lh source/ldid.cpp source/ldid.hpp
+
+      - name: Run source regression tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 tests/ldid_source_checks.py \
+            --source-dir "${GITHUB_WORKSPACE}/source" \
+            --workflow "${GITHUB_WORKSPACE}/.github/workflows/build_libs.yml" \
+            --compiler clang++
 
       - name: Build OpenSSL static libraries for iOS arm64
         shell: bash
@@ -587,6 +550,25 @@ jobs:
           test -f third_party/curl-headers/curl/curl.h
           test -f third_party/libarchive/include/archive.h
 
+      - name: iOS arm64 syntax-only compile
+        shell: bash
+        run: |
+          set -euo pipefail
+          WS="${GITHUB_WORKSPACE}"
+          SDK="${IOS_SDK_PATH}"
+          "${IOS_CXX}" \
+            -std=c++20 -fsyntax-only ${OPT_CFLAGS} -fvisibility=hidden \
+            -target "arm64-apple-ios${IOS_DEPLOYMENT_TARGET}" \
+            -isysroot "${SDK}" \
+            -I"${WS}/source/libplist_include" \
+            -I"${WS}/source/openssl_include" \
+            -I"${WS}/third_party/curl-headers" \
+            -I"${WS}/third_party/libarchive/include" \
+            -I"${WS}/third_party/xz/include" \
+            -I"${WS}/third_party/zstd/include" \
+            -I"${WS}/third_party/bzip2/include" \
+            "${WS}/source/ldid.cpp"
+
       - name: Compile ldid for iOS arm64
         shell: bash
         run: |
@@ -595,11 +577,7 @@ jobs:
           SDK="${IOS_SDK_PATH}"
           mkdir -p "${WS}/build"
 
-          cp "${WS}/source/ldid.cpp" \
-            "${WS}/source/ldid.hpp" \
-            "${WS}/source/der_engine.hpp" \
-            "${WS}/source/cms_attribute_engine.hpp" \
-            "${WS}/theos-build/"
+          cp "${WS}/source/ldid.cpp" "${WS}/source/ldid.hpp" "${WS}/theos-build/"
 
           "${IOS_CXX}" \
             -std=c++20 ${OPT_CFLAGS} ${LTO_CFLAGS} -fvisibility=hidden \
@@ -692,11 +670,7 @@ jobs:
           cp "${WS}/build/ldid" "${WS}/dist/ldid"
           chmod 755 "${WS}/dist/ldid"
 
-          cp "${WS}/source/ldid.cpp" \
-            "${WS}/source/ldid.hpp" \
-            "${WS}/source/der_engine.hpp" \
-            "${WS}/source/cms_attribute_engine.hpp" \
-            "${WS}/deps-package/source/"
+          cp "${WS}/source/ldid.cpp" "${WS}/source/ldid.hpp" "${WS}/deps-package/source/"
           cp -R "${WS}/source/libplist_include" "${WS}/source/libplist_lib" \
             "${WS}/source/openssl_include" "${WS}/source/openssl_lib" \
             "${WS}/deps-package/source/"
